@@ -6,11 +6,14 @@ use core::cmp::Ordering;
 
 use alloc::{boxed::Box, string::String, vec, vec::Vec};
 
-pub use crate::ast::visitor::{visit, Visitor};
+pub use crate::ast::visitor::{
+    project_ast, project_class_set, project_class_set_item, AstFrame,
+    ClassSetChild, ClassSetFrame, WithContext,
+};
 
 pub mod parse;
 pub mod print;
-mod visitor;
+pub mod visitor;
 
 /// An error that occurred while parsing a regular expression into an abstract
 /// syntax tree.

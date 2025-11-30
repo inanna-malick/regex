@@ -3174,6 +3174,10 @@ mod tests {
         // TODO: This is a good candidate of a seq of literals that could be
         // shrunk quite a bit and still be very productive with respect to
         // literal optimizations.
+        //
+        // Even though there are a lot of literals, the set is still easily
+        // shrunk quite a bit and still be very productive with respect to
+        // literal optimizations.
         let (prefixes, suffixes) = e(pat);
         assert!(!suffixes.is_finite());
         assert_eq!(Some(243), prefixes.len());

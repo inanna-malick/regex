@@ -37,6 +37,7 @@ unicode-segment = []
 
 [dependencies]
 arbitrary = { version = "1.3.0", features = ["derive"], optional = true }
+recursion = "0.5"
 
 [package.metadata.docs.rs]
 # We want to document all features.
