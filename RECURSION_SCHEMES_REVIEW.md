@@ -28,7 +28,7 @@ The printer is a perfect example of a simple catamorphism:
 ```rust
 expand_and_collapse::<AstFrame<PartiallyApplied>, _, _>(
     ast,
-    |node| project_ast(node),
+    project_ast,
     |frame| match frame { ... }
 )
 ```
@@ -45,52 +45,21 @@ The "flags-in-seed" pattern is a **creative and FP-idiomatic solution** to a tri
 
 The `FrameWithFlags` wrapper (`translate.rs:309-327`) composing over `AstFrame` is a clean use of the functor composition pattern.
 
-### 5. WithContext Abstraction (`visitor.rs:302-312`)
-
-The generic `WithContext<F, C>` wrapper is a good abstraction that could be reused. It cleanly separates the concern of "attach context to a frame."
-
 ---
 
 ## Suggestions for Improvement
 
-### 1. Consider Extracting Common Patterns
+All major suggestions have been addressed. One remaining minor opportunity:
 
-The pattern of `AstFrame::map_frame(frame, |child| (child, flags))` appears multiple times. Consider a helper:
+### Consider Extracting Common Patterns
+
+The pattern of `AstFrame::map_frame(frame, |child| (child, flags))` appears multiple times. A helper could reduce verbosity:
 
 ```rust
 fn attach_context<A, C: Clone>(frame: AstFrame<A>, ctx: C) -> AstFrame<(A, C)> {
     AstFrame::map_frame(frame, |a| (a, ctx))
 }
 ```
-
-### 2. ~~The `compute_exit_flags` Function Uses Explicit Recursion~~ ✅ ADDRESSED
-
-Now uses a catamorphism that collapses to `FlagOp` enum:
-- `FlagOp::Identity` - no change to flags
-- `FlagOp::SetFlags(ast::Flags)` - merge with parsed flags
-- `FlagOp::Compose(Vec<FlagOp>)` - compose children left-to-right
-
-### 3. ~~ClassSetFrame is Partially Used~~ ✅ ADDRESSED
-
-Added `project_class_set_child` function that unifies projection of `ClassSet` and `ClassSetItem`. The `check_class_set_nest_limit` function now uses `try_expand_and_collapse` with `ClassSetChild` as the seed type.
-
-### 4. The `project_class_set_item_as_set` Panic (`visitor.rs:264-266`)
-
-```rust
-ast::ClassSetItem::Union(_) => {
-    panic!("project_class_set_item_as_set called on Union - use dedicated traversal")
-}
-```
-
-This panic is a code smell. Consider either:
-
-- Making this function return `Option` or `Result`
-- Using a type-level distinction (separate types for "set that can contain union" vs "set that cannot")
-- Documenting more clearly when each projection function should be used
-
-### 5. Minor: Expand Phase Could Be More Declarative
-
-In `translate.rs:220-301`, the expand phase has significant branching for `Concat`, `Group`, `Alternation`, vs. other nodes. This is correct but verbose. A more FP approach might use a trait to encode flag propagation rules per-variant, but this might be over-engineering for this use case.
 
 ---
 
@@ -102,9 +71,9 @@ In `translate.rs:220-301`, the expand phase has significant branching for `Conca
 | **Catamorphism usage** | A | Correct use of `expand_and_collapse` |
 | **Separation of concerns** | A | Expansion (structure) vs collapse (algebra) well separated |
 | **Context threading** | A | Flags-in-seed pattern is elegant |
-| **Composability** | A- | `FrameWithFlags` composes well; `FlagOp` shows good use of data-as-functions |
-| **Totality** | B | One panic in projection function |
-| **Consistency** | A- | Explicit recursion replaced with catamorphisms |
+| **Composability** | A | `FrameWithFlags` composes well; `FlagOp` shows good use of data-as-functions |
+| **Totality** | A | No panics in projection functions |
+| **Consistency** | A | All traversals use catamorphisms |
 
 ---
 
@@ -115,9 +84,7 @@ This is **high-quality FP code** in a production Rust context. The recursion sch
 **Addressed in this review:**
 - ✅ `compute_exit_flags` now uses catamorphism with `FlagOp` enum
 - ✅ `check_class_set_nest_limit` now uses catamorphism with unified `project_class_set_child`
-
-**Remaining opportunities:**
-1. Handle the `project_class_set_item_as_set` panic more gracefully
-2. Extract common patterns like context attachment
+- ✅ Removed dead code (`project_class_set_item_as_set`, `WithContext`, unused re-exports)
+- ✅ Trimmed verbose doc comments and tests
 
 **Overall: Approved**
