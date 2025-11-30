@@ -63,25 +63,16 @@ fn attach_context<A, C: Clone>(frame: AstFrame<A>, ctx: C) -> AstFrame<(A, C)> {
 }
 ```
 
-### 2. The `compute_exit_flags` Function Uses Explicit Recursion
+### 2. ~~The `compute_exit_flags` Function Uses Explicit Recursion~~ ✅ ADDRESSED
 
-At `translate.rs:167-203`, `compute_exit_flags` uses explicit recursion - the very thing recursion schemes avoid. For consistency and stack safety, this could be rewritten as a catamorphism:
+Now uses a catamorphism that collapses to `FlagOp` enum:
+- `FlagOp::Identity` - no change to flags
+- `FlagOp::SetFlags(ast::Flags)` - merge with parsed flags
+- `FlagOp::Compose(Vec<FlagOp>)` - compose children left-to-right
 
-```rust
-fn compute_exit_flags(ast: &Ast, flags: Flags) -> Flags {
-    expand_and_collapse::<AstFrame<PartiallyApplied>, _, _>(
-        (ast, flags),
-        |(node, f)| { /* project with flag propagation */ },
-        |frame| { /* synthesize exit flags */ }
-    )
-}
-```
+### 3. ~~ClassSetFrame is Partially Used~~ ✅ ADDRESSED
 
-However, this function likely operates on small subtrees where stack overflow isn't a concern, so the explicit recursion may be intentional for simplicity.
-
-### 3. ClassSetFrame is Partially Used
-
-`ClassSetFrame` and `project_class_set_item` (`visitor.rs:154-300`) are defined but `check_class_set_nest_limit` (`parse.rs:2332-2357`) uses explicit recursion instead. For consistency, consider converting to catamorphism or documenting why explicit recursion is preferred here.
+Added `project_class_set_child` function that unifies projection of `ClassSet` and `ClassSetItem`. The `check_class_set_nest_limit` function now uses `try_expand_and_collapse` with `ClassSetChild` as the seed type.
 
 ### 4. The `project_class_set_item_as_set` Panic (`visitor.rs:264-266`)
 
@@ -111,9 +102,9 @@ In `translate.rs:220-301`, the expand phase has significant branching for `Conca
 | **Catamorphism usage** | A | Correct use of `expand_and_collapse` |
 | **Separation of concerns** | A | Expansion (structure) vs collapse (algebra) well separated |
 | **Context threading** | A | Flags-in-seed pattern is elegant |
-| **Composability** | B+ | `FrameWithFlags` composes well; could extract more patterns |
+| **Composability** | A- | `FrameWithFlags` composes well; `FlagOp` shows good use of data-as-functions |
 | **Totality** | B | One panic in projection function |
-| **Consistency** | B | Some explicit recursion remains alongside catamorphisms |
+| **Consistency** | A- | Explicit recursion replaced with catamorphisms |
 
 ---
 
@@ -121,10 +112,12 @@ In `translate.rs:220-301`, the expand phase has significant branching for `Conca
 
 This is **high-quality FP code** in a production Rust context. The recursion schemes are applied correctly, the abstractions are at the right level, and the "flags-in-seed" pattern demonstrates creative problem-solving within the catamorphism framework.
 
-The main opportunities are:
+**Addressed in this review:**
+- ✅ `compute_exit_flags` now uses catamorphism with `FlagOp` enum
+- ✅ `check_class_set_nest_limit` now uses catamorphism with unified `project_class_set_child`
 
-1. Convert remaining explicit recursions for consistency
-2. Handle the `project_class_set_item_as_set` panic more gracefully
-3. Extract common patterns like context attachment
+**Remaining opportunities:**
+1. Handle the `project_class_set_item_as_set` panic more gracefully
+2. Extract common patterns like context attachment
 
-**Overall: Approved with minor suggestions**
+**Overall: Approved**
