@@ -19,23 +19,23 @@ use crate::ast::{self, Ast, Span};
 /// [`expand_and_collapse`]: recursion::expand_and_collapse
 #[derive(Clone, Debug)]
 #[allow(missing_docs)]
-pub enum AstFrame<A> {
+pub enum AstFrame<'a, A> {
     Empty(Span),
-    Flags(ast::SetFlags),
-    Literal(ast::Literal),
+    Flags(&'a ast::SetFlags),
+    Literal(&'a ast::Literal),
     Dot(Span),
-    Assertion(ast::Assertion),
-    ClassUnicode(ast::ClassUnicode),
-    ClassPerl(ast::ClassPerl),
-    ClassBracketed(ast::ClassBracketed),
-    Repetition { span: Span, op: ast::RepetitionOp, greedy: bool, child: A },
-    Group { span: Span, kind: ast::GroupKind, child: A },
+    Assertion(&'a ast::Assertion),
+    ClassUnicode(&'a ast::ClassUnicode),
+    ClassPerl(&'a ast::ClassPerl),
+    ClassBracketed(&'a ast::ClassBracketed),
+    Repetition { span: Span, op: &'a ast::RepetitionOp, greedy: bool, child: A },
+    Group { span: Span, kind: &'a ast::GroupKind, child: A },
     Concat { span: Span, children: Vec<A> },
     Alternation { span: Span, children: Vec<A> },
 }
 
-impl MappableFrame for AstFrame<PartiallyApplied> {
-    type Frame<X> = AstFrame<X>;
+impl<'a> MappableFrame for AstFrame<'a, PartiallyApplied> {
+    type Frame<X> = AstFrame<'a, X>;
 
     fn map_frame<A, B>(
         input: Self::Frame<A>,
@@ -73,25 +73,25 @@ impl MappableFrame for AstFrame<PartiallyApplied> {
 /// Project an AST node into a frame with children as AST references.
 ///
 /// This is the fundamental projection function used by `expand_and_collapse`.
-pub fn project_ast(ast: &Ast) -> AstFrame<&Ast> {
+pub fn project_ast(ast: &Ast) -> AstFrame<'_, &Ast> {
     match ast {
         Ast::Empty(span) => AstFrame::Empty(**span),
-        Ast::Flags(f) => AstFrame::Flags((**f).clone()),
-        Ast::Literal(lit) => AstFrame::Literal((**lit).clone()),
+        Ast::Flags(f) => AstFrame::Flags(f),
+        Ast::Literal(lit) => AstFrame::Literal(lit),
         Ast::Dot(span) => AstFrame::Dot(**span),
-        Ast::Assertion(a) => AstFrame::Assertion((**a).clone()),
-        Ast::ClassUnicode(c) => AstFrame::ClassUnicode((**c).clone()),
-        Ast::ClassPerl(c) => AstFrame::ClassPerl((**c).clone()),
-        Ast::ClassBracketed(c) => AstFrame::ClassBracketed((**c).clone()),
+        Ast::Assertion(a) => AstFrame::Assertion(a),
+        Ast::ClassUnicode(c) => AstFrame::ClassUnicode(c),
+        Ast::ClassPerl(c) => AstFrame::ClassPerl(c),
+        Ast::ClassBracketed(c) => AstFrame::ClassBracketed(c),
         Ast::Repetition(rep) => AstFrame::Repetition {
             span: rep.span,
-            op: rep.op.clone(),
+            op: &rep.op,
             greedy: rep.greedy,
             child: &rep.ast,
         },
         Ast::Group(g) => AstFrame::Group {
             span: g.span,
-            kind: g.kind.clone(),
+            kind: &g.kind,
             child: &g.ast,
         },
         Ast::Concat(c) => AstFrame::Concat {
@@ -108,20 +108,20 @@ pub fn project_ast(ast: &Ast) -> AstFrame<&Ast> {
 /// One layer of character class structure with recursive positions replaced by `A`.
 #[derive(Clone, Debug)]
 #[allow(missing_docs)]
-pub enum ClassSetFrame<A> {
+pub enum ClassSetFrame<'a, A> {
     Empty(Span),
-    Literal(ast::Literal),
-    Range(ast::ClassSetRange),
-    Ascii(ast::ClassAscii),
-    Unicode(ast::ClassUnicode),
-    Perl(ast::ClassPerl),
+    Literal(&'a ast::Literal),
+    Range(&'a ast::ClassSetRange),
+    Ascii(&'a ast::ClassAscii),
+    Unicode(&'a ast::ClassUnicode),
+    Perl(&'a ast::ClassPerl),
     Bracketed { span: Span, negated: bool, child: A },
     Union { span: Span, children: Vec<A> },
     BinaryOp { span: Span, kind: ast::ClassSetBinaryOpKind, lhs: A, rhs: A },
 }
 
-impl MappableFrame for ClassSetFrame<PartiallyApplied> {
-    type Frame<X> = ClassSetFrame<X>;
+impl<'a> MappableFrame for ClassSetFrame<'a, PartiallyApplied> {
+    type Frame<X> = ClassSetFrame<'a, X>;
 
     fn map_frame<A, B>(
         input: Self::Frame<A>,
@@ -156,14 +156,14 @@ impl MappableFrame for ClassSetFrame<PartiallyApplied> {
 /// Project a ClassSetItem into a frame.
 pub fn project_class_set_item(
     item: &ast::ClassSetItem,
-) -> ClassSetFrame<ClassSetChild<'_>> {
+) -> ClassSetFrame<'_, ClassSetChild<'_>> {
     match item {
         ast::ClassSetItem::Empty(span) => ClassSetFrame::Empty(*span),
-        ast::ClassSetItem::Literal(lit) => ClassSetFrame::Literal(lit.clone()),
-        ast::ClassSetItem::Range(r) => ClassSetFrame::Range(r.clone()),
-        ast::ClassSetItem::Ascii(a) => ClassSetFrame::Ascii(a.clone()),
-        ast::ClassSetItem::Unicode(u) => ClassSetFrame::Unicode(u.clone()),
-        ast::ClassSetItem::Perl(p) => ClassSetFrame::Perl(p.clone()),
+        ast::ClassSetItem::Literal(lit) => ClassSetFrame::Literal(lit),
+        ast::ClassSetItem::Range(r) => ClassSetFrame::Range(r),
+        ast::ClassSetItem::Ascii(a) => ClassSetFrame::Ascii(a),
+        ast::ClassSetItem::Unicode(u) => ClassSetFrame::Unicode(u),
+        ast::ClassSetItem::Perl(p) => ClassSetFrame::Perl(p),
         ast::ClassSetItem::Bracketed(b) => ClassSetFrame::Bracketed {
             span: b.span,
             negated: b.negated,
@@ -185,7 +185,7 @@ pub enum ClassSetChild<'a> {
 }
 
 /// Project a ClassSetChild into a frame (unifies ClassSetItem and ClassSet).
-pub fn project_class_set_child(child: ClassSetChild<'_>) -> ClassSetFrame<ClassSetChild<'_>> {
+pub fn project_class_set_child(child: ClassSetChild<'_>) -> ClassSetFrame<'_, ClassSetChild<'_>> {
     match child {
         ClassSetChild::Item(item) => project_class_set_item(item),
         ClassSetChild::Set(set) => match set {

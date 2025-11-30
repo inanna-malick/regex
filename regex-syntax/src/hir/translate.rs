@@ -263,7 +263,7 @@ impl Translator {
                             flags,
                             frame: AstFrame::Group {
                                 span: g.span,
-                                kind: g.kind.clone(),
+                                kind: &g.kind,
                                 child: (&*g.ast, child_flags),
                             },
                         })
@@ -313,13 +313,13 @@ impl Translator {
 
 /// A frame wrapper that carries the current node's flags through collapse.
 #[derive(Clone, Debug)]
-struct FrameWithFlags<A> {
+struct FrameWithFlags<'a, A> {
     flags: Flags,
-    frame: AstFrame<A>,
+    frame: AstFrame<'a, A>,
 }
 
-impl MappableFrame for FrameWithFlags<PartiallyApplied> {
-    type Frame<X> = FrameWithFlags<X>;
+impl<'a> MappableFrame for FrameWithFlags<'a, PartiallyApplied> {
+    type Frame<X> = FrameWithFlags<'a, X>;
 
     fn map_frame<A, B>(
         input: Self::Frame<A>,
