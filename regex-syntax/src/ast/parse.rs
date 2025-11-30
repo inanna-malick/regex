@@ -2296,13 +2296,13 @@ fn check_nest_limit<P: Borrow<Parser>>(
             let child_depth = if is_recursive {
                 let new_depth = depth.checked_add(1).ok_or_else(|| {
                     p.error(
-                        span.unwrap().clone(),
+                        *span.unwrap(),
                         ast::ErrorKind::NestLimitExceeded(u32::MAX),
                     )
                 })?;
                 if new_depth > limit {
                     return Err(p.error(
-                        span.unwrap().clone(),
+                        *span.unwrap(),
                         ast::ErrorKind::NestLimitExceeded(limit),
                     ));
                 }

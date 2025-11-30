@@ -608,16 +608,10 @@ impl<'t, 'p> TranslatorI<'t, 'p> {
 
         if self.flags().case_insensitive() {
             lhs.try_case_fold_simple().map_err(|_| {
-                self.error(
-                    op.lhs.span().clone(),
-                    ErrorKind::UnicodeCaseUnavailable,
-                )
+                self.error(*op.lhs.span(), ErrorKind::UnicodeCaseUnavailable)
             })?;
             rhs.try_case_fold_simple().map_err(|_| {
-                self.error(
-                    op.rhs.span().clone(),
-                    ErrorKind::UnicodeCaseUnavailable,
-                )
+                self.error(*op.rhs.span(), ErrorKind::UnicodeCaseUnavailable)
             })?;
         }
 
@@ -940,7 +934,7 @@ impl<'t, 'p> TranslatorI<'t, 'p> {
         result: core::result::Result<hir::ClassUnicode, unicode::Error>,
     ) -> Result<hir::ClassUnicode> {
         result.map_err(|err| {
-            let sp = span.clone();
+            let sp = *span;
             match err {
                 unicode::Error::PropertyNotFound => {
                     self.error(sp, ErrorKind::UnicodePropertyNotFound)
@@ -967,7 +961,7 @@ impl<'t, 'p> TranslatorI<'t, 'p> {
         // Unicode scalar value.
         if self.flags().case_insensitive() {
             class.try_case_fold_simple().map_err(|_| {
-                self.error(span.clone(), ErrorKind::UnicodeCaseUnavailable)
+                self.error(*span, ErrorKind::UnicodeCaseUnavailable)
             })?;
         }
         if negated {
@@ -993,7 +987,7 @@ impl<'t, 'p> TranslatorI<'t, 'p> {
             class.negate();
         }
         if self.trans().utf8 && !class.is_ascii() {
-            return Err(self.error(span.clone(), ErrorKind::InvalidUtf8));
+            return Err(self.error(*span, ErrorKind::InvalidUtf8));
         }
         Ok(())
     }
