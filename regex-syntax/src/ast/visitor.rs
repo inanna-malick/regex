@@ -299,6 +299,25 @@ pub enum ClassSetChild<'a> {
     Set(&'a ast::ClassSet),
 }
 
+/// Project a ClassSetChild into a frame.
+///
+/// This unifies projection of both ClassSetItem and ClassSet, enabling
+/// traversal of the mutually recursive class set types.
+pub fn project_class_set_child(child: ClassSetChild<'_>) -> ClassSetFrame<ClassSetChild<'_>> {
+    match child {
+        ClassSetChild::Item(item) => project_class_set_item(item),
+        ClassSetChild::Set(set) => match set {
+            ast::ClassSet::Item(item) => project_class_set_item(item),
+            ast::ClassSet::BinaryOp(op) => ClassSetFrame::BinaryOp {
+                span: op.span,
+                kind: op.kind,
+                lhs: ClassSetChild::Set(&op.lhs),
+                rhs: ClassSetChild::Set(&op.rhs),
+            },
+        },
+    }
+}
+
 /// Frame wrapper that pairs a frame with context (like flags).
 ///
 /// This enables the "flags in seed" pattern: during expansion, context flows
