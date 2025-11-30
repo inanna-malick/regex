@@ -188,8 +188,8 @@ impl Translator {
                 | AstFrame::ClassBracketed(_) => FlagOp::Identity,
 
                 // Flags node: merge with parsed flags
-                AstFrame::Flags(ref set_flags) => {
-                    FlagOp::SetFlags(set_flags.flags.clone())
+                AstFrame::Flags(set_flags) => {
+                    FlagOp::SetFlags(&set_flags.flags)
                 }
 
                 // Groups restore flags on exit, so identity
@@ -1040,22 +1040,22 @@ struct Flags {
 /// composed and then applied. This enables a catamorphism-based implementation
 /// of `compute_exit_flags` that is stack-safe.
 #[derive(Clone, Debug)]
-enum FlagOp {
+enum FlagOp<'a> {
     /// No change to flags (identity transformation).
     Identity,
     /// Set flags from an AST Flags node (merges with input).
-    SetFlags(ast::Flags),
+    SetFlags(&'a ast::Flags),
     /// Compose multiple operations left-to-right.
-    Compose(Vec<FlagOp>),
+    Compose(Vec<FlagOp<'a>>),
 }
 
-impl FlagOp {
+impl FlagOp<'_> {
     /// Apply this flag operation to the given flags.
     fn apply(self, flags: Flags) -> Flags {
         match self {
             FlagOp::Identity => flags,
             FlagOp::SetFlags(ast_flags) => {
-                let mut new_flags = Flags::from_ast(&ast_flags);
+                let mut new_flags = Flags::from_ast(ast_flags);
                 new_flags.merge(&flags);
                 new_flags
             }
