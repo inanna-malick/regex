@@ -174,10 +174,9 @@ impl Translator {
     /// Uses a catamorphism that collapses to `FlagOp` (a representation of the
     /// flag transformation), then applies it to the input flags.
     fn compute_exit_flags(ast: &Ast, flags: Flags) -> Flags {
-        // Collapse to a FlagOp representing the transformation, then apply
         let op = expand_and_collapse::<AstFrame<PartiallyApplied>, _, _>(
             ast,
-            |node| project_ast(node),
+            project_ast,
             |frame| match frame {
                 // Leaf nodes: identity transformation
                 AstFrame::Empty(_)
