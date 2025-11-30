@@ -160,6 +160,60 @@ impl Translator {
         TranslatorBuilder::new().build()
     }
 
+    /// Compute the flags that would be active after traversing an AST subtree.
+    ///
+    /// This mimics the original visitor's behavior where flags set via `(?i)` etc.
+    /// persist across sibling nodes in the traversal order.
+    fn compute_exit_flags(ast: &Ast, flags: Flags) -> Flags {
+        match ast {
+            Ast::Flags(f) => {
+                let mut new_flags = Flags::from_ast(&f.flags);
+                new_flags.merge(&flags);
+                new_flags
+            }
+            Ast::Concat(c) => {
+                // Process children left-to-right, accumulating flag changes
+                let mut current = flags;
+                for child in &c.asts {
+                    current = Self::compute_exit_flags(child, current);
+                }
+                current
+            }
+            Ast::Alternation(a) => {
+                // Process branches left-to-right, accumulating flag changes
+                let mut current = flags;
+                for child in &a.asts {
+                    current = Self::compute_exit_flags(child, current);
+                }
+                current
+            }
+            Ast::Group(g) => {
+                // Groups with flags: the group's flags apply inside, but on exit
+                // we restore to what they were before (with the group's explicit
+                // flags merged in for NonCapturing groups that set flags)
+                match &g.kind {
+                    ast::GroupKind::NonCapturing(ast_flags) => {
+                        // Non-capturing groups like (?i:...) have their own flag scope
+                        // After exiting, flags revert to what they were before
+                        // But first we need to compute what happens inside
+                        let mut inner_flags = Flags::from_ast(ast_flags);
+                        inner_flags.merge(&flags);
+                        // Process child with inner flags, but return original flags
+                        let _ = Self::compute_exit_flags(&g.ast, inner_flags);
+                        flags
+                    }
+                    _ => {
+                        // Capturing groups don't change flags
+                        Self::compute_exit_flags(&g.ast, flags)
+                    }
+                }
+            }
+            Ast::Repetition(r) => Self::compute_exit_flags(&r.ast, flags),
+            // Leaf nodes don't change flags
+            _ => flags,
+        }
+    }
+
     /// Translate the given abstract syntax tree (AST) into a high level
     /// intermediate representation (HIR).
     ///
@@ -213,6 +267,22 @@ impl Translator {
                                 kind: g.kind.clone(),
                                 child: (&*g.ast, child_flags),
                             },
+                        })
+                    }
+                    Ast::Alternation(a) => {
+                        // For alternation, flags from Flags nodes at the start of earlier
+                        // branches affect later branches. This matches the original visitor
+                        // behavior where set_flags() persists across alternation branches.
+                        let mut current_flags = flags;
+                        let children: Vec<_> = a.asts.iter().map(|child| {
+                            let child_flags = current_flags;
+                            // Check if this branch starts with flags (directly or in a Concat)
+                            current_flags = Self::compute_exit_flags(child, current_flags);
+                            (child, child_flags)
+                        }).collect();
+                        Ok(FrameWithFlags {
+                            flags,
+                            frame: AstFrame::Alternation { span: a.span, children },
                         })
                     }
                     _ => {

@@ -40,7 +40,7 @@ impl Printer {
     }
 }
 
-/// Print an AST to a string using the recursion crate's stack-safe traversal.
+/// Print an AST to a string.
 fn print_ast(ast: &Ast) -> String {
     expand_and_collapse::<AstFrame<PartiallyApplied>, _, _>(
         ast,

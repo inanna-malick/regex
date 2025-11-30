@@ -3175,13 +3175,12 @@ mod tests {
         // shrunk quite a bit and still be very productive with respect to
         // literal optimizations.
         //
-        // NOTE: The expected count changed from 243 to 1 after the recursion
-        // crate refactoring. The literal extractor now finds a single common
-        // prefix ("33") when the total enumerated literals would exceed the
-        // default limit of 250. This is valid optimization behavior.
+        // Even though there are a lot of literals, the set is still easily
+        // shrunk quite a bit and still be very productive with respect to
+        // literal optimizations.
         let (prefixes, suffixes) = e(pat);
         assert!(!suffixes.is_finite());
-        assert_eq!(Some(1), prefixes.len());
+        assert_eq!(Some(243), prefixes.len());
     }
 
     #[test]

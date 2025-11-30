@@ -2261,9 +2261,6 @@ impl<'s, P: Borrow<Parser>> ParserI<'s, P> {
 }
 
 /// Check that the AST's nesting depth doesn't exceed the limit.
-///
-/// Uses recursion crate's stack-safe traversal with depth threaded through
-/// the seed type (flags-in-seed pattern).
 fn check_nest_limit<P: Borrow<Parser>>(
     p: &ParserI<'_, P>,
     ast: &Ast,
