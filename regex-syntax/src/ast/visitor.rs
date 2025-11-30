@@ -1,522 +1,347 @@
-use alloc::{vec, vec::Vec};
+/*!
+Provides a stack-safe traversal of the AST using recursion schemes.
 
-use crate::ast::{self, Ast};
+This module replaces the hand-rolled stack machine with the `recursion` crate's
+`Collapsible` pattern. The key types are:
 
-/// A trait for visiting an abstract syntax tree (AST) in depth first order.
+- [`AstFrame`]: One layer of AST structure with child positions replaced by a type parameter
+- [`ClassSetFrame`]: One layer of character class structure
+
+These frame types implement `MappableFrame` from the recursion crate, enabling
+stack-safe traversal via `collapse_frames` and `try_collapse_frames`.
+*/
+
+use alloc::vec::Vec;
+
+use recursion::{Collapsible, CollapsibleExt, MappableFrame, PartiallyApplied};
+
+use crate::ast::{self, Ast, Span};
+
+/// A single layer of AST structure with recursive positions replaced by `A`.
 ///
-/// The principle aim of this trait is to enable callers to perform case
-/// analysis on an abstract syntax tree without necessarily using recursion.
-/// In particular, this permits callers to do case analysis with constant stack
-/// usage, which can be important since the size of an abstract syntax tree
-/// may be proportional to end user input.
-///
-/// Typical usage of this trait involves providing an implementation and then
-/// running it using the [`visit`] function.
-///
-/// Note that the abstract syntax tree for a regular expression is quite
-/// complex. Unless you specifically need it, you might be able to use the much
-/// simpler [high-level intermediate representation](crate::hir::Hir) and its
-/// [corresponding `Visitor` trait](crate::hir::Visitor) instead.
-pub trait Visitor {
-    /// The result of visiting an AST.
-    type Output;
-    /// An error that visiting an AST might return.
-    type Err;
-
-    /// All implementors of `Visitor` must provide a `finish` method, which
-    /// yields the result of visiting the AST or an error.
-    fn finish(self) -> Result<Self::Output, Self::Err>;
-
-    /// This method is called before beginning traversal of the AST.
-    fn start(&mut self) {}
-
-    /// This method is called on an `Ast` before descending into child `Ast`
-    /// nodes.
-    fn visit_pre(&mut self, _ast: &Ast) -> Result<(), Self::Err> {
-        Ok(())
-    }
-
-    /// This method is called on an `Ast` after descending all of its child
-    /// `Ast` nodes.
-    fn visit_post(&mut self, _ast: &Ast) -> Result<(), Self::Err> {
-        Ok(())
-    }
-
-    /// This method is called between child nodes of an
-    /// [`Alternation`](ast::Alternation).
-    fn visit_alternation_in(&mut self) -> Result<(), Self::Err> {
-        Ok(())
-    }
-
-    /// This method is called between child nodes of a concatenation.
-    fn visit_concat_in(&mut self) -> Result<(), Self::Err> {
-        Ok(())
-    }
-
-    /// This method is called on every [`ClassSetItem`](ast::ClassSetItem)
-    /// before descending into child nodes.
-    fn visit_class_set_item_pre(
-        &mut self,
-        _ast: &ast::ClassSetItem,
-    ) -> Result<(), Self::Err> {
-        Ok(())
-    }
-
-    /// This method is called on every [`ClassSetItem`](ast::ClassSetItem)
-    /// after descending into child nodes.
-    fn visit_class_set_item_post(
-        &mut self,
-        _ast: &ast::ClassSetItem,
-    ) -> Result<(), Self::Err> {
-        Ok(())
-    }
-
-    /// This method is called on every
-    /// [`ClassSetBinaryOp`](ast::ClassSetBinaryOp) before descending into
-    /// child nodes.
-    fn visit_class_set_binary_op_pre(
-        &mut self,
-        _ast: &ast::ClassSetBinaryOp,
-    ) -> Result<(), Self::Err> {
-        Ok(())
-    }
-
-    /// This method is called on every
-    /// [`ClassSetBinaryOp`](ast::ClassSetBinaryOp) after descending into child
-    /// nodes.
-    fn visit_class_set_binary_op_post(
-        &mut self,
-        _ast: &ast::ClassSetBinaryOp,
-    ) -> Result<(), Self::Err> {
-        Ok(())
-    }
-
-    /// This method is called between the left hand and right hand child nodes
-    /// of a [`ClassSetBinaryOp`](ast::ClassSetBinaryOp).
-    fn visit_class_set_binary_op_in(
-        &mut self,
-        _ast: &ast::ClassSetBinaryOp,
-    ) -> Result<(), Self::Err> {
-        Ok(())
-    }
-}
-
-/// Executes an implementation of `Visitor` in constant stack space.
-///
-/// This function will visit every node in the given `Ast` while calling the
-/// appropriate methods provided by the [`Visitor`] trait.
-///
-/// The primary use case for this method is when one wants to perform case
-/// analysis over an `Ast` without using a stack size proportional to the depth
-/// of the `Ast`. Namely, this method will instead use constant stack size, but
-/// will use heap space proportional to the size of the `Ast`. This may be
-/// desirable in cases where the size of `Ast` is proportional to end user
-/// input.
-///
-/// If the visitor returns an error at any point, then visiting is stopped and
-/// the error is returned.
-pub fn visit<V: Visitor>(ast: &Ast, visitor: V) -> Result<V::Output, V::Err> {
-    HeapVisitor::new().visit(ast, visitor)
-}
-
-/// HeapVisitor visits every item in an `Ast` recursively using constant stack
-/// size and a heap size proportional to the size of the `Ast`.
-struct HeapVisitor<'a> {
-    /// A stack of `Ast` nodes. This is roughly analogous to the call stack
-    /// used in a typical recursive visitor.
-    stack: Vec<(&'a Ast, Frame<'a>)>,
-    /// Similar to the `Ast` stack above, but is used only for character
-    /// classes. In particular, character classes embed their own mini
-    /// recursive syntax.
-    stack_class: Vec<(ClassInduct<'a>, ClassFrame<'a>)>,
-}
-
-/// Represents a single stack frame while performing structural induction over
-/// an `Ast`.
-enum Frame<'a> {
-    /// A stack frame allocated just before descending into a repetition
-    /// operator's child node.
-    Repetition(&'a ast::Repetition),
-    /// A stack frame allocated just before descending into a group's child
-    /// node.
-    Group(&'a ast::Group),
-    /// The stack frame used while visiting every child node of a concatenation
-    /// of expressions.
+/// This is the "base functor" for the AST type. Each variant corresponds to an
+/// AST node, but recursive child positions contain `A` instead of `Box<Ast>`.
+#[derive(Clone, Debug)]
+pub enum AstFrame<A> {
+    /// An empty regex (matches the empty string).
+    Empty(Span),
+    /// A set of flags, e.g., `(?is)`.
+    Flags(ast::SetFlags),
+    /// A literal character or escape sequence.
+    Literal(ast::Literal),
+    /// The "any character" class, e.g., `.`.
+    Dot(Span),
+    /// An assertion (anchor), e.g., `^`, `$`, `\b`.
+    Assertion(ast::Assertion),
+    /// A Unicode character class, e.g., `\pN`.
+    ClassUnicode(ast::ClassUnicode),
+    /// A Perl character class, e.g., `\d`, `\s`, `\w`.
+    ClassPerl(ast::ClassPerl),
+    /// A bracketed character class, e.g., `[a-z]`.
+    ClassBracketed(ast::ClassBracketed),
+    /// A repetition, e.g., `a*`, `a+`, `a?`, `a{1,3}`.
+    Repetition {
+        /// Span of the repetition.
+        span: Span,
+        /// The repetition operator.
+        op: ast::RepetitionOp,
+        /// Whether the repetition is greedy.
+        greedy: bool,
+        /// The sub-expression being repeated (already collapsed).
+        child: A,
+    },
+    /// A grouped sub-expression, e.g., `(a)`, `(?:a)`, `(?P<name>a)`.
+    Group {
+        /// Span of the group.
+        span: Span,
+        /// The kind of group.
+        kind: ast::GroupKind,
+        /// The sub-expression inside the group (already collapsed).
+        child: A,
+    },
+    /// A concatenation of sub-expressions.
     Concat {
-        /// The child node we are currently visiting.
-        head: &'a Ast,
-        /// The remaining child nodes to visit (which may be empty).
-        tail: &'a [Ast],
+        /// Span of the concatenation.
+        span: Span,
+        /// The sub-expressions (already collapsed, in order).
+        children: Vec<A>,
     },
-    /// The stack frame used while visiting every child node of an alternation
-    /// of expressions.
+    /// An alternation of sub-expressions, e.g., `a|b|c`.
     Alternation {
-        /// The child node we are currently visiting.
-        head: &'a Ast,
-        /// The remaining child nodes to visit (which may be empty).
-        tail: &'a [Ast],
+        /// Span of the alternation.
+        span: Span,
+        /// The alternative branches (already collapsed, in order).
+        children: Vec<A>,
     },
 }
 
-/// Represents a single stack frame while performing structural induction over
-/// a character class.
-enum ClassFrame<'a> {
-    /// The stack frame used while visiting every child node of a union of
-    /// character class items.
-    Union {
-        /// The child node we are currently visiting.
-        head: &'a ast::ClassSetItem,
-        /// The remaining child nodes to visit (which may be empty).
-        tail: &'a [ast::ClassSetItem],
-    },
-    /// The stack frame used while a binary class operation.
-    Binary { op: &'a ast::ClassSetBinaryOp },
-    /// A stack frame allocated just before descending into a binary operator's
-    /// left hand child node.
-    BinaryLHS {
-        op: &'a ast::ClassSetBinaryOp,
-        lhs: &'a ast::ClassSet,
-        rhs: &'a ast::ClassSet,
-    },
-    /// A stack frame allocated just before descending into a binary operator's
-    /// right hand child node.
-    BinaryRHS { op: &'a ast::ClassSetBinaryOp, rhs: &'a ast::ClassSet },
+impl MappableFrame for AstFrame<PartiallyApplied> {
+    type Frame<X> = AstFrame<X>;
+
+    fn map_frame<A, B>(input: Self::Frame<A>, mut f: impl FnMut(A) -> B) -> Self::Frame<B> {
+        match input {
+            AstFrame::Empty(span) => AstFrame::Empty(span),
+            AstFrame::Flags(flags) => AstFrame::Flags(flags),
+            AstFrame::Literal(lit) => AstFrame::Literal(lit),
+            AstFrame::Dot(span) => AstFrame::Dot(span),
+            AstFrame::Assertion(a) => AstFrame::Assertion(a),
+            AstFrame::ClassUnicode(c) => AstFrame::ClassUnicode(c),
+            AstFrame::ClassPerl(c) => AstFrame::ClassPerl(c),
+            AstFrame::ClassBracketed(c) => AstFrame::ClassBracketed(c),
+            AstFrame::Repetition { span, op, greedy, child } => {
+                AstFrame::Repetition { span, op, greedy, child: f(child) }
+            }
+            AstFrame::Group { span, kind, child } => {
+                AstFrame::Group { span, kind, child: f(child) }
+            }
+            AstFrame::Concat { span, children } => {
+                AstFrame::Concat { span, children: children.into_iter().map(f).collect() }
+            }
+            AstFrame::Alternation { span, children } => {
+                AstFrame::Alternation { span, children: children.into_iter().map(f).collect() }
+            }
+        }
+    }
 }
 
-/// A representation of the inductive step when performing structural induction
-/// over a character class.
+/// Owned AST wrapper for Collapsible implementation.
 ///
-/// Note that there is no analogous explicit type for the inductive step for
-/// `Ast` nodes because the inductive step is just an `Ast`. For character
-/// classes, the inductive step can produce one of two possible child nodes:
-/// an item or a binary operation. (An item cannot be a binary operation
-/// because that would imply binary operations can be unioned in the concrete
-/// syntax, which is not possible.)
-enum ClassInduct<'a> {
-    Item(&'a ast::ClassSetItem),
-    BinaryOp(&'a ast::ClassSetBinaryOp),
-}
+/// The recursion crate requires owned values, so we clone the AST.
+/// For large ASTs, consider using a reference-based approach with
+/// explicit stack management instead.
+#[derive(Clone, Debug)]
+pub struct OwnedAst(pub Ast);
 
-impl<'a> HeapVisitor<'a> {
-    fn new() -> HeapVisitor<'a> {
-        HeapVisitor { stack: vec![], stack_class: vec![] }
-    }
+impl Collapsible for OwnedAst {
+    type FrameToken = AstFrame<PartiallyApplied>;
 
-    fn visit<V: Visitor>(
-        &mut self,
-        mut ast: &'a Ast,
-        mut visitor: V,
-    ) -> Result<V::Output, V::Err> {
-        self.stack.clear();
-        self.stack_class.clear();
-
-        visitor.start();
-        loop {
-            visitor.visit_pre(ast)?;
-            if let Some(x) = self.induct(ast, &mut visitor)? {
-                let child = x.child();
-                self.stack.push((ast, x));
-                ast = child;
-                continue;
-            }
-            // No induction means we have a base case, so we can post visit
-            // it now.
-            visitor.visit_post(ast)?;
-
-            // At this point, we now try to pop our call stack until it is
-            // either empty or we hit another inductive case.
-            loop {
-                let (post_ast, frame) = match self.stack.pop() {
-                    None => return visitor.finish(),
-                    Some((post_ast, frame)) => (post_ast, frame),
-                };
-                // If this is a concat/alternate, then we might have additional
-                // inductive steps to process.
-                if let Some(x) = self.pop(frame) {
-                    match x {
-                        Frame::Alternation { .. } => {
-                            visitor.visit_alternation_in()?;
-                        }
-                        Frame::Concat { .. } => {
-                            visitor.visit_concat_in()?;
-                        }
-                        _ => {}
-                    }
-                    ast = x.child();
-                    self.stack.push((post_ast, x));
-                    break;
-                }
-                // Otherwise, we've finished visiting all the child nodes for
-                // this AST, so we can post visit it now.
-                visitor.visit_post(post_ast)?;
-            }
-        }
-    }
-
-    /// Build a stack frame for the given AST if one is needed (which occurs if
-    /// and only if there are child nodes in the AST). Otherwise, return None.
-    ///
-    /// If this visits a class, then the underlying visitor implementation may
-    /// return an error which will be passed on here.
-    fn induct<V: Visitor>(
-        &mut self,
-        ast: &'a Ast,
-        visitor: &mut V,
-    ) -> Result<Option<Frame<'a>>, V::Err> {
-        Ok(match *ast {
-            Ast::ClassBracketed(ref x) => {
-                self.visit_class(x, visitor)?;
-                None
-            }
-            Ast::Repetition(ref x) => Some(Frame::Repetition(x)),
-            Ast::Group(ref x) => Some(Frame::Group(x)),
-            Ast::Concat(ref x) if x.asts.is_empty() => None,
-            Ast::Concat(ref x) => {
-                Some(Frame::Concat { head: &x.asts[0], tail: &x.asts[1..] })
-            }
-            Ast::Alternation(ref x) if x.asts.is_empty() => None,
-            Ast::Alternation(ref x) => Some(Frame::Alternation {
-                head: &x.asts[0],
-                tail: &x.asts[1..],
-            }),
-            _ => None,
-        })
-    }
-
-    /// Pops the given frame. If the frame has an additional inductive step,
-    /// then return it, otherwise return `None`.
-    fn pop(&self, induct: Frame<'a>) -> Option<Frame<'a>> {
-        match induct {
-            Frame::Repetition(_) => None,
-            Frame::Group(_) => None,
-            Frame::Concat { tail, .. } => {
-                if tail.is_empty() {
-                    None
-                } else {
-                    Some(Frame::Concat { head: &tail[0], tail: &tail[1..] })
-                }
-            }
-            Frame::Alternation { tail, .. } => {
-                if tail.is_empty() {
-                    None
-                } else {
-                    Some(Frame::Alternation {
-                        head: &tail[0],
-                        tail: &tail[1..],
-                    })
-                }
-            }
-        }
-    }
-
-    fn visit_class<V: Visitor>(
-        &mut self,
-        ast: &'a ast::ClassBracketed,
-        visitor: &mut V,
-    ) -> Result<(), V::Err> {
-        let mut ast = ClassInduct::from_bracketed(ast);
-        loop {
-            self.visit_class_pre(&ast, visitor)?;
-            if let Some(x) = self.induct_class(&ast) {
-                let child = x.child();
-                self.stack_class.push((ast, x));
-                ast = child;
-                continue;
-            }
-            self.visit_class_post(&ast, visitor)?;
-
-            // At this point, we now try to pop our call stack until it is
-            // either empty or we hit another inductive case.
-            loop {
-                let (post_ast, frame) = match self.stack_class.pop() {
-                    None => return Ok(()),
-                    Some((post_ast, frame)) => (post_ast, frame),
-                };
-                // If this is a union or a binary op, then we might have
-                // additional inductive steps to process.
-                if let Some(x) = self.pop_class(frame) {
-                    if let ClassFrame::BinaryRHS { ref op, .. } = x {
-                        visitor.visit_class_set_binary_op_in(op)?;
-                    }
-                    ast = x.child();
-                    self.stack_class.push((post_ast, x));
-                    break;
-                }
-                // Otherwise, we've finished visiting all the child nodes for
-                // this class node, so we can post visit it now.
-                self.visit_class_post(&post_ast, visitor)?;
-            }
-        }
-    }
-
-    /// Call the appropriate `Visitor` methods given an inductive step.
-    fn visit_class_pre<V: Visitor>(
-        &self,
-        ast: &ClassInduct<'a>,
-        visitor: &mut V,
-    ) -> Result<(), V::Err> {
-        match *ast {
-            ClassInduct::Item(item) => {
-                visitor.visit_class_set_item_pre(item)?;
-            }
-            ClassInduct::BinaryOp(op) => {
-                visitor.visit_class_set_binary_op_pre(op)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Call the appropriate `Visitor` methods given an inductive step.
-    fn visit_class_post<V: Visitor>(
-        &self,
-        ast: &ClassInduct<'a>,
-        visitor: &mut V,
-    ) -> Result<(), V::Err> {
-        match *ast {
-            ClassInduct::Item(item) => {
-                visitor.visit_class_set_item_post(item)?;
-            }
-            ClassInduct::BinaryOp(op) => {
-                visitor.visit_class_set_binary_op_post(op)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Build a stack frame for the given class node if one is needed (which
-    /// occurs if and only if there are child nodes). Otherwise, return None.
-    fn induct_class(&self, ast: &ClassInduct<'a>) -> Option<ClassFrame<'a>> {
-        match *ast {
-            ClassInduct::Item(&ast::ClassSetItem::Bracketed(ref x)) => {
-                match x.kind {
-                    ast::ClassSet::Item(ref item) => {
-                        Some(ClassFrame::Union { head: item, tail: &[] })
-                    }
-                    ast::ClassSet::BinaryOp(ref op) => {
-                        Some(ClassFrame::Binary { op })
-                    }
-                }
-            }
-            ClassInduct::Item(&ast::ClassSetItem::Union(ref x)) => {
-                if x.items.is_empty() {
-                    None
-                } else {
-                    Some(ClassFrame::Union {
-                        head: &x.items[0],
-                        tail: &x.items[1..],
-                    })
-                }
-            }
-            ClassInduct::BinaryOp(op) => {
-                Some(ClassFrame::BinaryLHS { op, lhs: &op.lhs, rhs: &op.rhs })
-            }
-            _ => None,
-        }
-    }
-
-    /// Pops the given frame. If the frame has an additional inductive step,
-    /// then return it, otherwise return `None`.
-    fn pop_class(&self, induct: ClassFrame<'a>) -> Option<ClassFrame<'a>> {
-        match induct {
-            ClassFrame::Union { tail, .. } => {
-                if tail.is_empty() {
-                    None
-                } else {
-                    Some(ClassFrame::Union {
-                        head: &tail[0],
-                        tail: &tail[1..],
-                    })
-                }
-            }
-            ClassFrame::Binary { .. } => None,
-            ClassFrame::BinaryLHS { op, rhs, .. } => {
-                Some(ClassFrame::BinaryRHS { op, rhs })
-            }
-            ClassFrame::BinaryRHS { .. } => None,
-        }
-    }
-}
-
-impl<'a> Frame<'a> {
-    /// Perform the next inductive step on this frame and return the next
-    /// child AST node to visit.
-    fn child(&self) -> &'a Ast {
-        match *self {
-            Frame::Repetition(rep) => &rep.ast,
-            Frame::Group(group) => &group.ast,
-            Frame::Concat { head, .. } => head,
-            Frame::Alternation { head, .. } => head,
-        }
-    }
-}
-
-impl<'a> ClassFrame<'a> {
-    /// Perform the next inductive step on this frame and return the next
-    /// child class node to visit.
-    fn child(&self) -> ClassInduct<'a> {
-        match *self {
-            ClassFrame::Union { head, .. } => ClassInduct::Item(head),
-            ClassFrame::Binary { op, .. } => ClassInduct::BinaryOp(op),
-            ClassFrame::BinaryLHS { ref lhs, .. } => {
-                ClassInduct::from_set(lhs)
-            }
-            ClassFrame::BinaryRHS { ref rhs, .. } => {
-                ClassInduct::from_set(rhs)
-            }
-        }
-    }
-}
-
-impl<'a> ClassInduct<'a> {
-    fn from_bracketed(ast: &'a ast::ClassBracketed) -> ClassInduct<'a> {
-        ClassInduct::from_set(&ast.kind)
-    }
-
-    fn from_set(ast: &'a ast::ClassSet) -> ClassInduct<'a> {
-        match *ast {
-            ast::ClassSet::Item(ref item) => ClassInduct::Item(item),
-            ast::ClassSet::BinaryOp(ref op) => ClassInduct::BinaryOp(op),
-        }
-    }
-}
-
-impl<'a> core::fmt::Debug for ClassFrame<'a> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let x = match *self {
-            ClassFrame::Union { .. } => "Union",
-            ClassFrame::Binary { .. } => "Binary",
-            ClassFrame::BinaryLHS { .. } => "BinaryLHS",
-            ClassFrame::BinaryRHS { .. } => "BinaryRHS",
-        };
-        write!(f, "{x}")
-    }
-}
-
-impl<'a> core::fmt::Debug for ClassInduct<'a> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let x = match *self {
-            ClassInduct::Item(it) => match *it {
-                ast::ClassSetItem::Empty(_) => "Item(Empty)",
-                ast::ClassSetItem::Literal(_) => "Item(Literal)",
-                ast::ClassSetItem::Range(_) => "Item(Range)",
-                ast::ClassSetItem::Ascii(_) => "Item(Ascii)",
-                ast::ClassSetItem::Perl(_) => "Item(Perl)",
-                ast::ClassSetItem::Unicode(_) => "Item(Unicode)",
-                ast::ClassSetItem::Bracketed(_) => "Item(Bracketed)",
-                ast::ClassSetItem::Union(_) => "Item(Union)",
+    fn into_frame(self) -> AstFrame<Self> {
+        match self.0 {
+            Ast::Empty(span) => AstFrame::Empty(*span),
+            Ast::Flags(f) => AstFrame::Flags(*f),
+            Ast::Literal(lit) => AstFrame::Literal(*lit),
+            Ast::Dot(span) => AstFrame::Dot(*span),
+            Ast::Assertion(a) => AstFrame::Assertion(*a),
+            Ast::ClassUnicode(c) => AstFrame::ClassUnicode(*c),
+            Ast::ClassPerl(c) => AstFrame::ClassPerl(*c),
+            Ast::ClassBracketed(c) => AstFrame::ClassBracketed(*c),
+            Ast::Repetition(rep) => AstFrame::Repetition {
+                span: rep.span,
+                op: rep.op.clone(),
+                greedy: rep.greedy,
+                child: OwnedAst((*rep.ast).clone()),
             },
-            ClassInduct::BinaryOp(it) => match it.kind {
-                ast::ClassSetBinaryOpKind::Intersection => {
-                    "BinaryOp(Intersection)"
-                }
-                ast::ClassSetBinaryOpKind::Difference => {
-                    "BinaryOp(Difference)"
-                }
-                ast::ClassSetBinaryOpKind::SymmetricDifference => {
-                    "BinaryOp(SymmetricDifference)"
-                }
+            Ast::Group(g) => AstFrame::Group {
+                span: g.span,
+                kind: g.kind.clone(),
+                child: OwnedAst((*g.ast).clone()),
             },
-        };
-        write!(f, "{x}")
+            Ast::Concat(c) => AstFrame::Concat {
+                span: c.span,
+                children: c.asts.into_iter().map(OwnedAst).collect(),
+            },
+            Ast::Alternation(a) => AstFrame::Alternation {
+                span: a.span,
+                children: a.asts.into_iter().map(OwnedAst).collect(),
+            },
+        }
+    }
+}
+
+/// A single layer of character class set structure.
+#[derive(Clone, Debug)]
+pub enum ClassSetFrame<A> {
+    /// An empty class set item.
+    Empty(Span),
+    /// A literal in a class.
+    Literal(ast::Literal),
+    /// A range in a class, e.g., `a-z`.
+    Range(ast::ClassSetRange),
+    /// An ASCII class, e.g., `[:alpha:]`.
+    Ascii(ast::ClassAscii),
+    /// A Unicode class inside a bracketed class.
+    Unicode(ast::ClassUnicode),
+    /// A Perl class inside a bracketed class.
+    Perl(ast::ClassPerl),
+    /// A nested bracketed class.
+    Bracketed {
+        /// Span and negation info.
+        span: Span,
+        negated: bool,
+        /// The contents of the nested class (already collapsed).
+        child: A,
+    },
+    /// A union of class items.
+    Union {
+        /// Span of the union.
+        span: Span,
+        /// The items in the union (already collapsed).
+        children: Vec<A>,
+    },
+    /// A binary set operation (intersection, difference, symmetric difference).
+    BinaryOp {
+        /// Span of the operation.
+        span: Span,
+        /// The kind of operation.
+        kind: ast::ClassSetBinaryOpKind,
+        /// Left-hand side (already collapsed).
+        lhs: A,
+        /// Right-hand side (already collapsed).
+        rhs: A,
+    },
+}
+
+impl MappableFrame for ClassSetFrame<PartiallyApplied> {
+    type Frame<X> = ClassSetFrame<X>;
+
+    fn map_frame<A, B>(input: Self::Frame<A>, mut f: impl FnMut(A) -> B) -> Self::Frame<B> {
+        match input {
+            ClassSetFrame::Empty(span) => ClassSetFrame::Empty(span),
+            ClassSetFrame::Literal(lit) => ClassSetFrame::Literal(lit),
+            ClassSetFrame::Range(r) => ClassSetFrame::Range(r),
+            ClassSetFrame::Ascii(a) => ClassSetFrame::Ascii(a),
+            ClassSetFrame::Unicode(u) => ClassSetFrame::Unicode(u),
+            ClassSetFrame::Perl(p) => ClassSetFrame::Perl(p),
+            ClassSetFrame::Bracketed { span, negated, child } => {
+                ClassSetFrame::Bracketed { span, negated, child: f(child) }
+            }
+            ClassSetFrame::Union { span, children } => {
+                ClassSetFrame::Union { span, children: children.into_iter().map(f).collect() }
+            }
+            ClassSetFrame::BinaryOp { span, kind, lhs, rhs } => {
+                ClassSetFrame::BinaryOp { span, kind, lhs: f(lhs), rhs: f(rhs) }
+            }
+        }
+    }
+}
+
+/// Owned ClassSet wrapper for Collapsible implementation.
+#[derive(Clone, Debug)]
+pub struct OwnedClassSet(pub ast::ClassSet);
+
+impl Collapsible for OwnedClassSet {
+    type FrameToken = ClassSetFrame<PartiallyApplied>;
+
+    fn into_frame(self) -> ClassSetFrame<Self> {
+        match self.0 {
+            ast::ClassSet::Item(item) => class_set_item_to_frame(item),
+            ast::ClassSet::BinaryOp(op) => ClassSetFrame::BinaryOp {
+                span: op.span,
+                kind: op.kind,
+                lhs: OwnedClassSet(*op.lhs),
+                rhs: OwnedClassSet(*op.rhs),
+            },
+        }
+    }
+}
+
+fn class_set_item_to_frame(item: ast::ClassSetItem) -> ClassSetFrame<OwnedClassSet> {
+    match item {
+        ast::ClassSetItem::Empty(span) => ClassSetFrame::Empty(span),
+        ast::ClassSetItem::Literal(lit) => ClassSetFrame::Literal(lit),
+        ast::ClassSetItem::Range(r) => ClassSetFrame::Range(r),
+        ast::ClassSetItem::Ascii(a) => ClassSetFrame::Ascii(a),
+        ast::ClassSetItem::Unicode(u) => ClassSetFrame::Unicode(u),
+        ast::ClassSetItem::Perl(p) => ClassSetFrame::Perl(p),
+        ast::ClassSetItem::Bracketed(b) => ClassSetFrame::Bracketed {
+            span: b.span,
+            negated: b.negated,
+            child: OwnedClassSet(b.kind),
+        },
+        ast::ClassSetItem::Union(u) => ClassSetFrame::Union {
+            span: u.span,
+            children: u.items.into_iter().map(|i| OwnedClassSet(ast::ClassSet::Item(i))).collect(),
+        },
+    }
+}
+
+/// Collapse an AST using a provided algebra function.
+///
+/// This is the primary way to process an AST with the recursion crate.
+/// The algebra receives each node after its children have been processed,
+/// with children replaced by the results of processing them.
+///
+/// # Stack Safety
+///
+/// This function is stack-safe: it uses heap allocation proportional to the
+/// AST size rather than stack space proportional to AST depth.
+pub fn collapse_ast<Out>(
+    ast: Ast,
+    f: impl FnMut(AstFrame<Out>) -> Out,
+) -> Out {
+    OwnedAst(ast).collapse_frames(f)
+}
+
+/// Collapse an AST using a fallible algebra function.
+///
+/// Like [`collapse_ast`] but the algebra can return errors, which will
+/// short-circuit the traversal.
+pub fn try_collapse_ast<Out, E>(
+    ast: Ast,
+    f: impl FnMut(AstFrame<Out>) -> Result<Out, E>,
+) -> Result<Out, E> {
+    OwnedAst(ast).try_collapse_frames(f)
+}
+
+/// Collapse a ClassSet using a provided algebra function.
+pub fn collapse_class_set<Out>(
+    set: ast::ClassSet,
+    f: impl FnMut(ClassSetFrame<Out>) -> Out,
+) -> Out {
+    OwnedClassSet(set).collapse_frames(f)
+}
+
+/// Collapse a ClassSet using a fallible algebra function.
+pub fn try_collapse_class_set<Out, E>(
+    set: ast::ClassSet,
+    f: impl FnMut(ClassSetFrame<Out>) -> Result<Out, E>,
+) -> Result<Out, E> {
+    OwnedClassSet(set).try_collapse_frames(f)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::parse::Parser;
+
+    #[test]
+    fn test_count_nodes() {
+        let ast = Parser::new().parse(r"a|b|c").unwrap();
+        let count = collapse_ast(ast, |frame| match frame {
+            AstFrame::Concat { children, .. } => 1 + children.into_iter().sum::<usize>(),
+            AstFrame::Alternation { children, .. } => 1 + children.into_iter().sum::<usize>(),
+            AstFrame::Repetition { child, .. } => 1 + child,
+            AstFrame::Group { child, .. } => 1 + child,
+            _ => 1,
+        });
+        // a|b|c parses to Alternation with 3 Literal children
+        assert_eq!(count, 4); // 1 alternation + 3 literals
+    }
+
+    #[test]
+    fn test_depth() {
+        let ast = Parser::new().parse(r"((a))").unwrap();
+        let depth = collapse_ast(ast, |frame| match frame {
+            AstFrame::Group { child, .. } => 1 + child,
+            AstFrame::Repetition { child, .. } => 1 + child,
+            AstFrame::Concat { children, .. } => {
+                children.into_iter().max().unwrap_or(0)
+            }
+            AstFrame::Alternation { children, .. } => {
+                children.into_iter().max().unwrap_or(0)
+            }
+            _ => 0,
+        });
+        assert_eq!(depth, 2); // Two nested groups
+    }
+
+    #[test]
+    fn test_fallible() {
+        let ast = Parser::new().parse(r"a*").unwrap();
+        let result: Result<(), &str> = try_collapse_ast(ast, |frame| match frame {
+            AstFrame::Repetition { .. } => Err("no repetitions allowed"),
+            _ => Ok(()),
+        });
+        assert!(result.is_err());
     }
 }
