@@ -17,7 +17,9 @@ use crate::{
     unicode::{self, ClassQuery},
 };
 
-use recursion::{try_expand_and_collapse, MappableFrame, PartiallyApplied};
+use recursion::{
+    expand_and_collapse, try_expand_and_collapse, MappableFrame, PartiallyApplied,
+};
 
 type Result<T> = core::result::Result<T, Error>;
 
@@ -168,38 +170,42 @@ impl Translator {
     ///
     /// This mimics the original visitor's behavior where flags set via `(?i)` etc.
     /// persist across sibling nodes in the traversal order.
+    ///
+    /// Uses a catamorphism that collapses to `FlagOp` (a representation of the
+    /// flag transformation), then applies it to the input flags.
     fn compute_exit_flags(ast: &Ast, flags: Flags) -> Flags {
-        match ast {
-            Ast::Flags(f) => {
-                let mut new_flags = Flags::from_ast(&f.flags);
-                new_flags.merge(&flags);
-                new_flags
-            }
-            Ast::Concat(c) => {
-                // Process children left-to-right, accumulating flag changes
-                let mut current = flags;
-                for child in &c.asts {
-                    current = Self::compute_exit_flags(child, current);
+        let op = expand_and_collapse::<AstFrame<PartiallyApplied>, _, _>(
+            ast,
+            project_ast,
+            |frame| match frame {
+                // Leaf nodes: identity transformation
+                AstFrame::Empty(_)
+                | AstFrame::Literal(_)
+                | AstFrame::Dot(_)
+                | AstFrame::Assertion(_)
+                | AstFrame::ClassUnicode(_)
+                | AstFrame::ClassPerl(_)
+                | AstFrame::ClassBracketed(_) => FlagOp::Identity,
+
+                // Flags node: merge with parsed flags
+                AstFrame::Flags(ref set_flags) => {
+                    FlagOp::SetFlags(set_flags.flags.clone())
                 }
-                current
-            }
-            Ast::Alternation(a) => {
-                // Process branches left-to-right, accumulating flag changes
-                let mut current = flags;
-                for child in &a.asts {
-                    current = Self::compute_exit_flags(child, current);
+
+                // Groups restore flags on exit, so identity
+                AstFrame::Group { .. } => FlagOp::Identity,
+
+                // Repetition: delegate to child's transformation
+                AstFrame::Repetition { child, .. } => child,
+
+                // Concat/Alternation: compose children left-to-right
+                AstFrame::Concat { children, .. }
+                | AstFrame::Alternation { children, .. } => {
+                    FlagOp::Compose(children)
                 }
-                current
-            }
-            Ast::Group(_) => {
-                // All groups (capturing and non-capturing) restore flags on exit.
-                // Flag changes inside a group don't leak to subsequent siblings.
-                flags
-            }
-            Ast::Repetition(r) => Self::compute_exit_flags(&r.ast, flags),
-            // Leaf nodes don't change flags
-            _ => flags,
-        }
+            },
+        );
+        op.apply(flags)
     }
 
     /// Translate the given abstract syntax tree (AST) into a high level
@@ -1026,6 +1032,38 @@ struct Flags {
     crlf: Option<bool>,
     // Note that `ignore_whitespace` is omitted here because it is handled
     // entirely in the parser.
+}
+
+/// Represents a transformation on Flags, used by `compute_exit_flags`.
+///
+/// This type allows expressing flag transformations as data, which can be
+/// composed and then applied. This enables a catamorphism-based implementation
+/// of `compute_exit_flags` that is stack-safe.
+#[derive(Clone, Debug)]
+enum FlagOp {
+    /// No change to flags (identity transformation).
+    Identity,
+    /// Set flags from an AST Flags node (merges with input).
+    SetFlags(ast::Flags),
+    /// Compose multiple operations left-to-right.
+    Compose(Vec<FlagOp>),
+}
+
+impl FlagOp {
+    /// Apply this flag operation to the given flags.
+    fn apply(self, flags: Flags) -> Flags {
+        match self {
+            FlagOp::Identity => flags,
+            FlagOp::SetFlags(ast_flags) => {
+                let mut new_flags = Flags::from_ast(&ast_flags);
+                new_flags.merge(&flags);
+                new_flags
+            }
+            FlagOp::Compose(ops) => {
+                ops.into_iter().fold(flags, |f, op| op.apply(f))
+            }
+        }
+    }
 }
 
 impl Flags {

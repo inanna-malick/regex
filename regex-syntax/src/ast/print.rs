@@ -55,7 +55,7 @@ impl Printer {
 fn print_ast(ast: &Ast) -> String {
     expand_and_collapse::<AstFrame<PartiallyApplied>, _, _>(
         ast,
-        |node| project_ast(node),
+        project_ast,
         |frame| match frame {
             AstFrame::Empty(_) => String::new(),
             AstFrame::Flags(x) => fmt_set_flags(&x),

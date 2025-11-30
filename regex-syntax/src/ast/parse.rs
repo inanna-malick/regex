@@ -2330,85 +2330,57 @@ fn check_nest_limit<P: Borrow<Parser>>(
 }
 
 /// Check nest limit for a ClassSet (character class internals).
+///
+/// Uses a catamorphism with `try_expand_and_collapse` for stack-safe traversal.
 fn check_class_set_nest_limit<P: Borrow<Parser>>(
     p: &ParserI<'_, P>,
     set: &ast::ClassSet,
     depth: u32,
     limit: u32,
 ) -> Result<()> {
-    match set {
-        ast::ClassSet::Item(item) => {
-            check_class_set_item_nest_limit(p, item, depth, limit)
-        }
-        ast::ClassSet::BinaryOp(op) => {
-            // Binary ops increase depth
-            let new_depth = depth.checked_add(1).ok_or_else(|| {
-                p.error(
-                    op.span.clone(),
-                    ast::ErrorKind::NestLimitExceeded(u32::MAX),
-                )
-            })?;
-            if new_depth > limit {
-                return Err(p.error(
-                    op.span.clone(),
-                    ast::ErrorKind::NestLimitExceeded(limit),
-                ));
-            }
-            check_class_set_nest_limit(p, &op.lhs, new_depth, limit)?;
-            check_class_set_nest_limit(p, &op.rhs, new_depth, limit)?;
-            Ok(())
-        }
-    }
-}
+    use ast::visitor::{project_class_set_child, ClassSetChild, ClassSetFrame};
+    use recursion::{try_expand_and_collapse, MappableFrame, PartiallyApplied};
 
-/// Check nest limit for a ClassSetItem.
-fn check_class_set_item_nest_limit<P: Borrow<Parser>>(
-    p: &ParserI<'_, P>,
-    item: &ast::ClassSetItem,
-    depth: u32,
-    limit: u32,
-) -> Result<()> {
-    match item {
-        ast::ClassSetItem::Empty(_)
-        | ast::ClassSetItem::Literal(_)
-        | ast::ClassSetItem::Range(_)
-        | ast::ClassSetItem::Ascii(_)
-        | ast::ClassSetItem::Unicode(_)
-        | ast::ClassSetItem::Perl(_) => Ok(()),
-        ast::ClassSetItem::Bracketed(ref b) => {
-            let new_depth = depth.checked_add(1).ok_or_else(|| {
-                p.error(
-                    b.span.clone(),
-                    ast::ErrorKind::NestLimitExceeded(u32::MAX),
-                )
-            })?;
-            if new_depth > limit {
-                return Err(p.error(
-                    b.span.clone(),
-                    ast::ErrorKind::NestLimitExceeded(limit),
-                ));
-            }
-            check_class_set_nest_limit(p, &b.kind, new_depth, limit)
-        }
-        ast::ClassSetItem::Union(ref u) => {
-            let new_depth = depth.checked_add(1).ok_or_else(|| {
-                p.error(
-                    u.span.clone(),
-                    ast::ErrorKind::NestLimitExceeded(u32::MAX),
-                )
-            })?;
-            if new_depth > limit {
-                return Err(p.error(
-                    u.span.clone(),
-                    ast::ErrorKind::NestLimitExceeded(limit),
-                ));
-            }
-            for item in &u.items {
-                check_class_set_item_nest_limit(p, item, new_depth, limit)?;
-            }
-            Ok(())
-        }
-    }
+    // Seed type: (ClassSetChild, depth)
+    try_expand_and_collapse::<ClassSetFrame<PartiallyApplied>, _, _, _>(
+        (ClassSetChild::Set(set), depth),
+        |(child, current_depth)| {
+            // Project and determine if this node increases depth
+            let frame = project_class_set_child(child);
+
+            // Check which variants increase depth and get their span
+            let (span, increases_depth) = match &frame {
+                ClassSetFrame::Empty(_)
+                | ClassSetFrame::Literal(_)
+                | ClassSetFrame::Range(_)
+                | ClassSetFrame::Ascii(_)
+                | ClassSetFrame::Unicode(_)
+                | ClassSetFrame::Perl(_) => (None, false),
+                ClassSetFrame::Bracketed { span, .. } => (Some(*span), true),
+                ClassSetFrame::Union { span, .. } => (Some(*span), true),
+                ClassSetFrame::BinaryOp { span, .. } => (Some(*span), true),
+            };
+
+            let child_depth = if increases_depth {
+                let new_depth = current_depth.checked_add(1).ok_or_else(|| {
+                    p.error(span.unwrap(), ast::ErrorKind::NestLimitExceeded(u32::MAX))
+                })?;
+                if new_depth > limit {
+                    return Err(p.error(
+                        span.unwrap(),
+                        ast::ErrorKind::NestLimitExceeded(limit),
+                    ));
+                }
+                new_depth
+            } else {
+                current_depth
+            };
+
+            // Attach child depth to all children
+            Ok(ClassSetFrame::map_frame(frame, |c| (c, child_depth)))
+        },
+        |_frame| Ok(()), // Collapse: nothing to do, checks happen during expansion
+    )
 }
 
 /// When the result is an error, transforms the ast::ErrorKind from the source
