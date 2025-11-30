@@ -2,7 +2,7 @@
 Defines a translator that converts an `Ast` to an `Hir`.
 */
 
-use core::cell::{Cell, RefCell};
+use core::cell::Cell;
 
 use alloc::{boxed::Box, string::ToString, vec, vec::Vec};
 
@@ -44,7 +44,6 @@ impl TranslatorBuilder {
     /// Build a translator using the current configuration.
     pub fn build(&self) -> Translator {
         Translator {
-            stack: RefCell::new(vec![]),
             flags: Cell::new(self.flags),
             utf8: self.utf8,
             line_terminator: self.line_terminator,
@@ -147,8 +146,6 @@ impl TranslatorBuilder {
 /// [`TranslatorBuilder`].
 #[derive(Clone, Debug)]
 pub struct Translator {
-    /// Our call stack, but on the heap.
-    stack: RefCell<Vec<HirFrame>>,
     /// The current flag settings.
     flags: Cell<Flags>,
     /// Whether we're allowed to produce HIR that can match arbitrary bytes.
@@ -173,498 +170,84 @@ impl Translator {
     /// provided. The translator does not use the pattern string during any
     /// correct translation, but is used for error reporting.
     pub fn translate(&mut self, pattern: &str, ast: &Ast) -> Result<Hir> {
-        ast::visit(ast, TranslatorI::new(self, pattern))
-    }
-}
+        let ti = TranslatorI::new(self, pattern);
+        let initial_flags = ti.trans().flags.get();
 
-/// An HirFrame is a single stack frame, represented explicitly, which is
-/// created for each item in the Ast that we traverse.
-///
-/// Note that technically, this type doesn't represent our entire stack
-/// frame. In particular, the Ast visitor represents any state associated with
-/// traversing the Ast itself.
-#[derive(Clone, Debug)]
-enum HirFrame {
-    /// An arbitrary HIR expression. These get pushed whenever we hit a base
-    /// case in the Ast. They get popped after an inductive (i.e., recursive)
-    /// step is complete.
-    Expr(Hir),
-    /// A literal that is being constructed, character by character, from the
-    /// AST. We need this because the AST gives each individual character its
-    /// own node. So as we see characters, we peek at the top-most HirFrame.
-    /// If it's a literal, then we add to it. Otherwise, we push a new literal.
-    /// When it comes time to pop it, we convert it to an Hir via Hir::literal.
-    Literal(Vec<u8>),
-    /// A Unicode character class. This frame is mutated as we descend into
-    /// the Ast of a character class (which is itself its own mini recursive
-    /// structure).
-    ClassUnicode(hir::ClassUnicode),
-    /// A byte-oriented character class. This frame is mutated as we descend
-    /// into the Ast of a character class (which is itself its own mini
-    /// recursive structure).
-    ///
-    /// Byte character classes are created when Unicode mode (`u`) is disabled.
-    /// If `utf8` is enabled (the default), then a byte character is only
-    /// permitted to match ASCII text.
-    ClassBytes(hir::ClassBytes),
-    /// This is pushed whenever a repetition is observed. After visiting every
-    /// sub-expression in the repetition, the translator's stack is expected to
-    /// have this sentinel at the top.
-    ///
-    /// This sentinel only exists to stop other things (like flattening
-    /// literals) from reaching across repetition operators.
-    Repetition,
-    /// This is pushed on to the stack upon first seeing any kind of capture,
-    /// indicated by parentheses (including non-capturing groups). It is popped
-    /// upon leaving a group.
-    Group {
-        /// The old active flags when this group was opened.
-        ///
-        /// If this group sets flags, then the new active flags are set to the
-        /// result of merging the old flags with the flags introduced by this
-        /// group. If the group doesn't set any flags, then this is simply
-        /// equivalent to whatever flags were set when the group was opened.
-        ///
-        /// When this group is popped, the active flags should be restored to
-        /// the flags set here.
-        ///
-        /// The "active" flags correspond to whatever flags are set in the
-        /// Translator.
-        old_flags: Flags,
-    },
-    /// This is pushed whenever a concatenation is observed. After visiting
-    /// every sub-expression in the concatenation, the translator's stack is
-    /// popped until it sees a Concat frame.
-    Concat,
-    /// This is pushed whenever an alternation is observed. After visiting
-    /// every sub-expression in the alternation, the translator's stack is
-    /// popped until it sees an Alternation frame.
-    Alternation,
-    /// This is pushed immediately before each sub-expression in an
-    /// alternation. This separates the branches of an alternation on the
-    /// stack and prevents literal flattening from reaching across alternation
-    /// branches.
-    ///
-    /// It is popped after each expression in a branch until an 'Alternation'
-    /// frame is observed when doing a post visit on an alternation.
-    AlternationBranch,
-}
-
-impl HirFrame {
-    /// Assert that the current stack frame is an Hir expression and return it.
-    fn unwrap_expr(self) -> Hir {
-        match self {
-            HirFrame::Expr(expr) => expr,
-            HirFrame::Literal(lit) => Hir::literal(lit),
-            _ => panic!("tried to unwrap expr from HirFrame, got: {self:?}"),
-        }
-    }
-
-    /// Assert that the current stack frame is a Unicode class expression and
-    /// return it.
-    fn unwrap_class_unicode(self) -> hir::ClassUnicode {
-        match self {
-            HirFrame::ClassUnicode(cls) => cls,
-            _ => panic!(
-                "tried to unwrap Unicode class \
-                 from HirFrame, got: {:?}",
-                self
-            ),
-        }
-    }
-
-    /// Assert that the current stack frame is a byte class expression and
-    /// return it.
-    fn unwrap_class_bytes(self) -> hir::ClassBytes {
-        match self {
-            HirFrame::ClassBytes(cls) => cls,
-            _ => panic!(
-                "tried to unwrap byte class \
-                 from HirFrame, got: {:?}",
-                self
-            ),
-        }
-    }
-
-    /// Assert that the current stack frame is a repetition sentinel. If it
-    /// isn't, then panic.
-    fn unwrap_repetition(self) {
-        match self {
-            HirFrame::Repetition => {}
-            _ => {
-                panic!(
-                    "tried to unwrap repetition from HirFrame, got: {self:?}"
-                )
-            }
-        }
-    }
-
-    /// Assert that the current stack frame is a group indicator and return
-    /// its corresponding flags (the flags that were active at the time the
-    /// group was entered).
-    fn unwrap_group(self) -> Flags {
-        match self {
-            HirFrame::Group { old_flags } => old_flags,
-            _ => {
-                panic!("tried to unwrap group from HirFrame, got: {self:?}")
-            }
-        }
-    }
-
-    /// Assert that the current stack frame is an alternation pipe sentinel. If
-    /// it isn't, then panic.
-    fn unwrap_alternation_pipe(self) {
-        match self {
-            HirFrame::AlternationBranch => {}
-            _ => {
-                panic!("tried to unwrap alt pipe from HirFrame, got: {self:?}")
-            }
-        }
-    }
-}
-
-impl<'t, 'p> Visitor for TranslatorI<'t, 'p> {
-    type Output = Hir;
-    type Err = Error;
-
-    fn finish(self) -> Result<Hir> {
-        // ... otherwise, we should have exactly one HIR on the stack.
-        assert_eq!(self.trans().stack.borrow().len(), 1);
-        Ok(self.pop().unwrap().unwrap_expr())
-    }
-
-    fn visit_pre(&mut self, ast: &Ast) -> Result<()> {
-        match *ast {
-            Ast::ClassBracketed(_) => {
-                if self.flags().unicode() {
-                    let cls = hir::ClassUnicode::empty();
-                    self.push(HirFrame::ClassUnicode(cls));
-                } else {
-                    let cls = hir::ClassBytes::empty();
-                    self.push(HirFrame::ClassBytes(cls));
-                }
-            }
-            Ast::Repetition(_) => self.push(HirFrame::Repetition),
-            Ast::Group(ref x) => {
-                let old_flags = x
-                    .flags()
-                    .map(|ast| self.set_flags(ast))
-                    .unwrap_or_else(|| self.flags());
-                self.push(HirFrame::Group { old_flags });
-            }
-            Ast::Concat(_) => {
-                self.push(HirFrame::Concat);
-            }
-            Ast::Alternation(ref x) => {
-                self.push(HirFrame::Alternation);
-                if !x.asts.is_empty() {
-                    self.push(HirFrame::AlternationBranch);
-                }
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    fn visit_post(&mut self, ast: &Ast) -> Result<()> {
-        match *ast {
-            Ast::Empty(_) => {
-                self.push(HirFrame::Expr(Hir::empty()));
-            }
-            Ast::Flags(ref x) => {
-                self.set_flags(&x.flags);
-                // Flags in the AST are generally considered directives and
-                // not actual sub-expressions. However, they can be used in
-                // the concrete syntax like `((?i))`, and we need some kind of
-                // indication of an expression there, and Empty is the correct
-                // choice.
-                //
-                // There can also be things like `(?i)+`, but we rule those out
-                // in the parser. In the future, we might allow them for
-                // consistency sake.
-                self.push(HirFrame::Expr(Hir::empty()));
-            }
-            Ast::Literal(ref x) => match self.ast_literal_to_scalar(x)? {
-                Either::Right(byte) => self.push_byte(byte),
-                Either::Left(ch) => match self.case_fold_char(x.span, ch)? {
-                    None => self.push_char(ch),
-                    Some(expr) => self.push(HirFrame::Expr(expr)),
-                },
-            },
-            Ast::Dot(ref span) => {
-                self.push(HirFrame::Expr(self.hir_dot(**span)?));
-            }
-            Ast::Assertion(ref x) => {
-                self.push(HirFrame::Expr(self.hir_assertion(x)?));
-            }
-            Ast::ClassPerl(ref x) => {
-                if self.flags().unicode() {
-                    let cls = self.hir_perl_unicode_class(x)?;
-                    let hcls = hir::Class::Unicode(cls);
-                    self.push(HirFrame::Expr(Hir::class(hcls)));
-                } else {
-                    let cls = self.hir_perl_byte_class(x)?;
-                    let hcls = hir::Class::Bytes(cls);
-                    self.push(HirFrame::Expr(Hir::class(hcls)));
-                }
-            }
-            Ast::ClassUnicode(ref x) => {
-                let cls = hir::Class::Unicode(self.hir_unicode_class(x)?);
-                self.push(HirFrame::Expr(Hir::class(cls)));
-            }
-            Ast::ClassBracketed(ref ast) => {
-                if self.flags().unicode() {
-                    let mut cls = self.pop().unwrap().unwrap_class_unicode();
-                    self.unicode_fold_and_negate(
-                        &ast.span,
-                        ast.negated,
-                        &mut cls,
-                    )?;
-                    let expr = Hir::class(hir::Class::Unicode(cls));
-                    self.push(HirFrame::Expr(expr));
-                } else {
-                    let mut cls = self.pop().unwrap().unwrap_class_bytes();
-                    self.bytes_fold_and_negate(
-                        &ast.span,
-                        ast.negated,
-                        &mut cls,
-                    )?;
-                    let expr = Hir::class(hir::Class::Bytes(cls));
-                    self.push(HirFrame::Expr(expr));
-                }
-            }
-            Ast::Repetition(ref x) => {
-                let expr = self.pop().unwrap().unwrap_expr();
-                self.pop().unwrap().unwrap_repetition();
-                self.push(HirFrame::Expr(self.hir_repetition(x, expr)));
-            }
-            Ast::Group(ref x) => {
-                let expr = self.pop().unwrap().unwrap_expr();
-                let old_flags = self.pop().unwrap().unwrap_group();
-                self.trans().flags.set(old_flags);
-                self.push(HirFrame::Expr(self.hir_capture(x, expr)));
-            }
-            Ast::Concat(_) => {
-                let mut exprs = vec![];
-                while let Some(expr) = self.pop_concat_expr() {
-                    if !matches!(*expr.kind(), HirKind::Empty) {
-                        exprs.push(expr);
+        try_expand_and_collapse::<FrameWithFlags<PartiallyApplied>, _, _, _>(
+            (ast, initial_flags),
+            |(node, flags)| {
+                // Expand: project the AST and compute child flags
+                // Handle flag propagation specially for Concat and Alternation
+                match node {
+                    Ast::Concat(c) => {
+                        // For concatenation, flags from Ast::Flags nodes affect subsequent siblings
+                        let mut current_flags = flags;
+                        let children: Vec<_> = c.asts.iter().map(|child| {
+                            // If this child is a Flags node, update flags for subsequent siblings
+                            if let Ast::Flags(ref f) = child {
+                                let mut new_flags = Flags::from_ast(&f.flags);
+                                new_flags.merge(&current_flags);
+                                current_flags = new_flags;
+                            }
+                            (child, current_flags)
+                        }).collect();
+                        Ok(FrameWithFlags {
+                            flags,
+                            frame: AstFrame::Concat { span: c.span, children },
+                        })
+                    }
+                    Ast::Group(g) => {
+                        // For groups with flags, update flags for the child
+                        let child_flags = match &g.kind {
+                            ast::GroupKind::NonCapturing(ast_flags) => {
+                                let mut new_flags = Flags::from_ast(ast_flags);
+                                new_flags.merge(&flags);
+                                new_flags
+                            }
+                            _ => flags,
+                        };
+                        Ok(FrameWithFlags {
+                            flags,
+                            frame: AstFrame::Group {
+                                span: g.span,
+                                kind: g.kind.clone(),
+                                child: (&*g.ast, child_flags),
+                            },
+                        })
+                    }
+                    _ => {
+                        // For other nodes, just project and pass flags through
+                        let frame = project_ast(node);
+                        Ok(FrameWithFlags {
+                            flags,
+                            frame: AstFrame::map_frame(frame, |child| (child, flags)),
+                        })
                     }
                 }
-                exprs.reverse();
-                self.push(HirFrame::Expr(Hir::concat(exprs)));
-            }
-            Ast::Alternation(_) => {
-                let mut exprs = vec![];
-                while let Some(expr) = self.pop_alt_expr() {
-                    self.pop().unwrap().unwrap_alternation_pipe();
-                    exprs.push(expr);
-                }
-                exprs.reverse();
-                self.push(HirFrame::Expr(Hir::alternation(exprs)));
-            }
-        }
-        Ok(())
-    }
-
-    fn visit_alternation_in(&mut self) -> Result<()> {
-        self.push(HirFrame::AlternationBranch);
-        Ok(())
-    }
-
-    fn visit_class_set_item_pre(
-        &mut self,
-        ast: &ast::ClassSetItem,
-    ) -> Result<()> {
-        match *ast {
-            ast::ClassSetItem::Bracketed(_) => {
-                if self.flags().unicode() {
-                    let cls = hir::ClassUnicode::empty();
-                    self.push(HirFrame::ClassUnicode(cls));
-                } else {
-                    let cls = hir::ClassBytes::empty();
-                    self.push(HirFrame::ClassBytes(cls));
-                }
-            }
-            // We needn't handle the Union case here since the visitor will
-            // do it for us.
-            _ => {}
-        }
-        Ok(())
-    }
-
-    fn visit_class_set_item_post(
-        &mut self,
-        ast: &ast::ClassSetItem,
-    ) -> Result<()> {
-        match *ast {
-            ast::ClassSetItem::Empty(_) => {}
-            ast::ClassSetItem::Literal(ref x) => {
-                if self.flags().unicode() {
-                    let mut cls = self.pop().unwrap().unwrap_class_unicode();
-                    cls.push(hir::ClassUnicodeRange::new(x.c, x.c));
-                    self.push(HirFrame::ClassUnicode(cls));
-                } else {
-                    let mut cls = self.pop().unwrap().unwrap_class_bytes();
-                    let byte = self.class_literal_byte(x)?;
-                    cls.push(hir::ClassBytesRange::new(byte, byte));
-                    self.push(HirFrame::ClassBytes(cls));
-                }
-            }
-            ast::ClassSetItem::Range(ref x) => {
-                if self.flags().unicode() {
-                    let mut cls = self.pop().unwrap().unwrap_class_unicode();
-                    cls.push(hir::ClassUnicodeRange::new(x.start.c, x.end.c));
-                    self.push(HirFrame::ClassUnicode(cls));
-                } else {
-                    let mut cls = self.pop().unwrap().unwrap_class_bytes();
-                    let start = self.class_literal_byte(&x.start)?;
-                    let end = self.class_literal_byte(&x.end)?;
-                    cls.push(hir::ClassBytesRange::new(start, end));
-                    self.push(HirFrame::ClassBytes(cls));
-                }
-            }
-            ast::ClassSetItem::Ascii(ref x) => {
-                if self.flags().unicode() {
-                    let xcls = self.hir_ascii_unicode_class(x)?;
-                    let mut cls = self.pop().unwrap().unwrap_class_unicode();
-                    cls.union(&xcls);
-                    self.push(HirFrame::ClassUnicode(cls));
-                } else {
-                    let xcls = self.hir_ascii_byte_class(x)?;
-                    let mut cls = self.pop().unwrap().unwrap_class_bytes();
-                    cls.union(&xcls);
-                    self.push(HirFrame::ClassBytes(cls));
-                }
-            }
-            ast::ClassSetItem::Unicode(ref x) => {
-                let xcls = self.hir_unicode_class(x)?;
-                let mut cls = self.pop().unwrap().unwrap_class_unicode();
-                cls.union(&xcls);
-                self.push(HirFrame::ClassUnicode(cls));
-            }
-            ast::ClassSetItem::Perl(ref x) => {
-                if self.flags().unicode() {
-                    let xcls = self.hir_perl_unicode_class(x)?;
-                    let mut cls = self.pop().unwrap().unwrap_class_unicode();
-                    cls.union(&xcls);
-                    self.push(HirFrame::ClassUnicode(cls));
-                } else {
-                    let xcls = self.hir_perl_byte_class(x)?;
-                    let mut cls = self.pop().unwrap().unwrap_class_bytes();
-                    cls.union(&xcls);
-                    self.push(HirFrame::ClassBytes(cls));
-                }
-            }
-            ast::ClassSetItem::Bracketed(ref ast) => {
-                if self.flags().unicode() {
-                    let mut cls1 = self.pop().unwrap().unwrap_class_unicode();
-                    self.unicode_fold_and_negate(
-                        &ast.span,
-                        ast.negated,
-                        &mut cls1,
-                    )?;
-
-                    let mut cls2 = self.pop().unwrap().unwrap_class_unicode();
-                    cls2.union(&cls1);
-                    self.push(HirFrame::ClassUnicode(cls2));
-                } else {
-                    let mut cls1 = self.pop().unwrap().unwrap_class_bytes();
-                    self.bytes_fold_and_negate(
-                        &ast.span,
-                        ast.negated,
-                        &mut cls1,
-                    )?;
-
-                    let mut cls2 = self.pop().unwrap().unwrap_class_bytes();
-                    cls2.union(&cls1);
-                    self.push(HirFrame::ClassBytes(cls2));
-                }
-            }
-            // This is handled automatically by the visitor.
-            ast::ClassSetItem::Union(_) => {}
-        }
-        Ok(())
-    }
-
-    fn visit_class_set_binary_op_pre(
-        &mut self,
-        _op: &ast::ClassSetBinaryOp,
-    ) -> Result<()> {
-        if self.flags().unicode() {
-            let cls = hir::ClassUnicode::empty();
-            self.push(HirFrame::ClassUnicode(cls));
-        } else {
-            let cls = hir::ClassBytes::empty();
-            self.push(HirFrame::ClassBytes(cls));
-        }
-        Ok(())
-    }
-
-    fn visit_class_set_binary_op_in(
-        &mut self,
-        _op: &ast::ClassSetBinaryOp,
-    ) -> Result<()> {
-        if self.flags().unicode() {
-            let cls = hir::ClassUnicode::empty();
-            self.push(HirFrame::ClassUnicode(cls));
-        } else {
-            let cls = hir::ClassBytes::empty();
-            self.push(HirFrame::ClassBytes(cls));
-        }
-        Ok(())
-    }
-
-    fn visit_class_set_binary_op_post(
-        &mut self,
-        op: &ast::ClassSetBinaryOp,
-    ) -> Result<()> {
-        use crate::ast::ClassSetBinaryOpKind::*;
-
-        if self.flags().unicode() {
-            let mut rhs = self.pop().unwrap().unwrap_class_unicode();
-            let mut lhs = self.pop().unwrap().unwrap_class_unicode();
-            let mut cls = self.pop().unwrap().unwrap_class_unicode();
-            if self.flags().case_insensitive() {
-                rhs.try_case_fold_simple().map_err(|_| {
-                    self.error(
-                        op.rhs.span().clone(),
-                        ErrorKind::UnicodeCaseUnavailable,
-                    )
-                })?;
-                lhs.try_case_fold_simple().map_err(|_| {
-                    self.error(
-                        op.lhs.span().clone(),
-                        ErrorKind::UnicodeCaseUnavailable,
-                    )
-                })?;
-            }
-            match op.kind {
-                Intersection => lhs.intersect(&rhs),
-                Difference => lhs.difference(&rhs),
-                SymmetricDifference => lhs.symmetric_difference(&rhs),
-            }
-            cls.union(&lhs);
-            self.push(HirFrame::ClassUnicode(cls));
-        } else {
-            let mut rhs = self.pop().unwrap().unwrap_class_bytes();
-            let mut lhs = self.pop().unwrap().unwrap_class_bytes();
-            let mut cls = self.pop().unwrap().unwrap_class_bytes();
-            if self.flags().case_insensitive() {
-                rhs.case_fold_simple();
-                lhs.case_fold_simple();
-            }
-            match op.kind {
-                Intersection => lhs.intersect(&rhs),
-                Difference => lhs.difference(&rhs),
-                SymmetricDifference => lhs.symmetric_difference(&rhs),
-            }
-            cls.union(&lhs);
-            self.push(HirFrame::ClassBytes(cls));
-        }
-        Ok(())
+            },
+            |fwf| ti.collapse_frame(fwf),
+        )
     }
 }
+
+/// A frame wrapper that carries the current node's flags through collapse.
+#[derive(Clone, Debug)]
+struct FrameWithFlags<A> {
+    flags: Flags,
+    frame: AstFrame<A>,
+}
+
+impl MappableFrame for FrameWithFlags<PartiallyApplied> {
+    type Frame<X> = FrameWithFlags<X>;
+
+    fn map_frame<A, B>(input: Self::Frame<A>, f: impl FnMut(A) -> B) -> Self::Frame<B> {
+        FrameWithFlags {
+            flags: input.flags,
+            frame: AstFrame::map_frame(input.frame, f),
+        }
+    }
+}
+
 
 /// The internal implementation of a translator.
 ///
@@ -689,108 +272,6 @@ impl<'t, 'p> TranslatorI<'t, 'p> {
         &self.trans
     }
 
-    /// Push the given frame on to the call stack.
-    fn push(&self, frame: HirFrame) {
-        self.trans().stack.borrow_mut().push(frame);
-    }
-
-    /// Push the given literal char on to the call stack.
-    ///
-    /// If the top-most element of the stack is a literal, then the char
-    /// is appended to the end of that literal. Otherwise, a new literal
-    /// containing just the given char is pushed to the top of the stack.
-    fn push_char(&self, ch: char) {
-        let mut buf = [0; 4];
-        let bytes = ch.encode_utf8(&mut buf).as_bytes();
-        let mut stack = self.trans().stack.borrow_mut();
-        if let Some(HirFrame::Literal(ref mut literal)) = stack.last_mut() {
-            literal.extend_from_slice(bytes);
-        } else {
-            stack.push(HirFrame::Literal(bytes.to_vec()));
-        }
-    }
-
-    /// Push the given literal byte on to the call stack.
-    ///
-    /// If the top-most element of the stack is a literal, then the byte
-    /// is appended to the end of that literal. Otherwise, a new literal
-    /// containing just the given byte is pushed to the top of the stack.
-    fn push_byte(&self, byte: u8) {
-        let mut stack = self.trans().stack.borrow_mut();
-        if let Some(HirFrame::Literal(ref mut literal)) = stack.last_mut() {
-            literal.push(byte);
-        } else {
-            stack.push(HirFrame::Literal(vec![byte]));
-        }
-    }
-
-    /// Pop the top of the call stack. If the call stack is empty, return None.
-    fn pop(&self) -> Option<HirFrame> {
-        self.trans().stack.borrow_mut().pop()
-    }
-
-    /// Pop an HIR expression from the top of the stack for a concatenation.
-    ///
-    /// This returns None if the stack is empty or when a concat frame is seen.
-    /// Otherwise, it panics if it could not find an HIR expression.
-    fn pop_concat_expr(&self) -> Option<Hir> {
-        let frame = self.pop()?;
-        match frame {
-            HirFrame::Concat => None,
-            HirFrame::Expr(expr) => Some(expr),
-            HirFrame::Literal(lit) => Some(Hir::literal(lit)),
-            HirFrame::ClassUnicode(_) => {
-                unreachable!("expected expr or concat, got Unicode class")
-            }
-            HirFrame::ClassBytes(_) => {
-                unreachable!("expected expr or concat, got byte class")
-            }
-            HirFrame::Repetition => {
-                unreachable!("expected expr or concat, got repetition")
-            }
-            HirFrame::Group { .. } => {
-                unreachable!("expected expr or concat, got group")
-            }
-            HirFrame::Alternation => {
-                unreachable!("expected expr or concat, got alt marker")
-            }
-            HirFrame::AlternationBranch => {
-                unreachable!("expected expr or concat, got alt branch marker")
-            }
-        }
-    }
-
-    /// Pop an HIR expression from the top of the stack for an alternation.
-    ///
-    /// This returns None if the stack is empty or when an alternation frame is
-    /// seen. Otherwise, it panics if it could not find an HIR expression.
-    fn pop_alt_expr(&self) -> Option<Hir> {
-        let frame = self.pop()?;
-        match frame {
-            HirFrame::Alternation => None,
-            HirFrame::Expr(expr) => Some(expr),
-            HirFrame::Literal(lit) => Some(Hir::literal(lit)),
-            HirFrame::ClassUnicode(_) => {
-                unreachable!("expected expr or alt, got Unicode class")
-            }
-            HirFrame::ClassBytes(_) => {
-                unreachable!("expected expr or alt, got byte class")
-            }
-            HirFrame::Repetition => {
-                unreachable!("expected expr or alt, got repetition")
-            }
-            HirFrame::Group { .. } => {
-                unreachable!("expected expr or alt, got group")
-            }
-            HirFrame::Concat => {
-                unreachable!("expected expr or alt, got concat marker")
-            }
-            HirFrame::AlternationBranch => {
-                unreachable!("expected expr or alt, got alt branch marker")
-            }
-        }
-    }
-
     /// Create a new error with the given span and error type.
     fn error(&self, span: Span, kind: ErrorKind) -> Error {
         Error { kind, pattern: self.pattern.to_string(), span }
@@ -801,14 +282,269 @@ impl<'t, 'p> TranslatorI<'t, 'p> {
         self.trans().flags.get()
     }
 
-    /// Set the flags of this translator from the flags set in the given AST.
-    /// Then, return the old flags.
-    fn set_flags(&self, ast_flags: &ast::Flags) -> Flags {
-        let old_flags = self.flags();
-        let mut new_flags = Flags::from_ast(ast_flags);
-        new_flags.merge(&old_flags);
-        self.trans().flags.set(new_flags);
-        old_flags
+    /// Collapse a FrameWithFlags into an Hir.
+    ///
+    /// This is the algebra for the catamorphism. Each frame carries its own flags
+    /// and contains children that have already been collapsed to Hir.
+    fn collapse_frame(&self, fwf: FrameWithFlags<Hir>) -> Result<Hir> {
+        let FrameWithFlags { flags, frame } = fwf;
+        // Set flags so helper methods see the correct context
+        self.trans().flags.set(flags);
+
+        match frame {
+            AstFrame::Empty(_) => Ok(Hir::empty()),
+            AstFrame::Flags(_x) => {
+                // Flags in the AST are generally considered directives and
+                // not actual sub-expressions. However, they can be used in
+                // the concrete syntax like `((?i))`, and we need some kind of
+                // indication of an expression there, and Empty is the correct
+                // choice.
+                Ok(Hir::empty())
+            }
+            AstFrame::Literal(ref x) => {
+                self.hir_literal(x)
+            }
+            AstFrame::Dot(span) => {
+                self.hir_dot(span)
+            }
+            AstFrame::Assertion(ref x) => {
+                self.hir_assertion(x)
+            }
+            AstFrame::ClassPerl(ref x) => {
+                if self.flags().unicode() {
+                    let cls = self.hir_perl_unicode_class(x)?;
+                    let hcls = hir::Class::Unicode(cls);
+                    Ok(Hir::class(hcls))
+                } else {
+                    let cls = self.hir_perl_byte_class(x)?;
+                    let hcls = hir::Class::Bytes(cls);
+                    Ok(Hir::class(hcls))
+                }
+            }
+            AstFrame::ClassUnicode(ref x) => {
+                let cls = hir::Class::Unicode(self.hir_unicode_class(x)?);
+                Ok(Hir::class(cls))
+            }
+            AstFrame::ClassBracketed(ref ast) => {
+                self.hir_class_bracketed(ast)
+            }
+            AstFrame::Repetition { span: _, ref op, greedy, child: expr } => {
+                Ok(self.hir_repetition_impl(op, greedy, expr))
+            }
+            AstFrame::Group { span: _, ref kind, child: expr } => {
+                Ok(self.hir_group(kind, expr))
+            }
+            AstFrame::Concat { span: _, children } => {
+                let exprs: Vec<Hir> = children
+                    .into_iter()
+                    .filter(|expr| !matches!(*expr.kind(), HirKind::Empty))
+                    .collect();
+                Ok(Hir::concat(exprs))
+            }
+            AstFrame::Alternation { span: _, children } => {
+                Ok(Hir::alternation(children))
+            }
+        }
+    }
+
+    /// Translate a literal AST node to HIR.
+    fn hir_literal(&self, lit: &ast::Literal) -> Result<Hir> {
+        match self.ast_literal_to_scalar(lit)? {
+            Either::Right(byte) => Ok(Hir::literal([byte])),
+            Either::Left(ch) => match self.case_fold_char(lit.span, ch)? {
+                None => {
+                    let mut buf = [0u8; 4];
+                    let s = ch.encode_utf8(&mut buf);
+                    Ok(Hir::literal(s.as_bytes().to_vec()))
+                }
+                Some(expr) => Ok(expr),
+            },
+        }
+    }
+
+    /// Translate a group AST node to HIR.
+    fn hir_group(&self, kind: &ast::GroupKind, expr: Hir) -> Hir {
+        let (index, name) = match kind {
+            ast::GroupKind::CaptureIndex(index) => (*index, None),
+            ast::GroupKind::CaptureName { ref name, .. } => {
+                (name.index, Some(name.name.clone().into_boxed_str()))
+            }
+            // The HIR doesn't need to use non-capturing groups, since the way
+            // in which the data type is defined handles this automatically.
+            ast::GroupKind::NonCapturing(_) => return expr,
+        };
+        Hir::capture(hir::Capture { index, name, sub: Box::new(expr) })
+    }
+
+    /// Translate a repetition AST node to HIR.
+    fn hir_repetition_impl(&self, op: &ast::RepetitionOp, greedy: bool, expr: Hir) -> Hir {
+        let (min, max) = match op.kind {
+            ast::RepetitionKind::ZeroOrOne => (0, Some(1)),
+            ast::RepetitionKind::ZeroOrMore => (0, None),
+            ast::RepetitionKind::OneOrMore => (1, None),
+            ast::RepetitionKind::Range(ast::RepetitionRange::Exactly(m)) => {
+                (m, Some(m))
+            }
+            ast::RepetitionKind::Range(ast::RepetitionRange::AtLeast(m)) => {
+                (m, None)
+            }
+            ast::RepetitionKind::Range(ast::RepetitionRange::Bounded(
+                m,
+                n,
+            )) => (m, Some(n)),
+        };
+        let greedy =
+            if self.flags().swap_greed() { !greedy } else { greedy };
+        Hir::repetition(hir::Repetition {
+            min,
+            max,
+            greedy,
+            sub: Box::new(expr),
+        })
+    }
+
+    /// Translate a bracketed character class to HIR.
+    fn hir_class_bracketed(&self, ast: &ast::ClassBracketed) -> Result<Hir> {
+        if self.flags().unicode() {
+            let mut cls = self.hir_class_set_unicode(&ast.kind)?;
+            self.unicode_fold_and_negate(&ast.span, ast.negated, &mut cls)?;
+            Ok(Hir::class(hir::Class::Unicode(cls)))
+        } else {
+            let mut cls = self.hir_class_set_bytes(&ast.kind)?;
+            self.bytes_fold_and_negate(&ast.span, ast.negated, &mut cls)?;
+            Ok(Hir::class(hir::Class::Bytes(cls)))
+        }
+    }
+
+    /// Translate a ClassSet to a Unicode class.
+    fn hir_class_set_unicode(&self, set: &ast::ClassSet) -> Result<hir::ClassUnicode> {
+        match set {
+            ast::ClassSet::Item(item) => self.hir_class_set_item_unicode(item),
+            ast::ClassSet::BinaryOp(op) => self.hir_class_binary_op_unicode(op),
+        }
+    }
+
+    /// Translate a ClassSet to a byte class.
+    fn hir_class_set_bytes(&self, set: &ast::ClassSet) -> Result<hir::ClassBytes> {
+        match set {
+            ast::ClassSet::Item(item) => self.hir_class_set_item_bytes(item),
+            ast::ClassSet::BinaryOp(op) => self.hir_class_binary_op_bytes(op),
+        }
+    }
+
+    /// Translate a ClassSetItem to a Unicode class.
+    fn hir_class_set_item_unicode(&self, item: &ast::ClassSetItem) -> Result<hir::ClassUnicode> {
+        match item {
+            ast::ClassSetItem::Empty(_) => Ok(hir::ClassUnicode::empty()),
+            ast::ClassSetItem::Literal(x) => {
+                let mut cls = hir::ClassUnicode::empty();
+                cls.push(hir::ClassUnicodeRange::new(x.c, x.c));
+                Ok(cls)
+            }
+            ast::ClassSetItem::Range(x) => {
+                let mut cls = hir::ClassUnicode::empty();
+                cls.push(hir::ClassUnicodeRange::new(x.start.c, x.end.c));
+                Ok(cls)
+            }
+            ast::ClassSetItem::Ascii(x) => self.hir_ascii_unicode_class(x),
+            ast::ClassSetItem::Unicode(x) => self.hir_unicode_class(x),
+            ast::ClassSetItem::Perl(x) => self.hir_perl_unicode_class(x),
+            ast::ClassSetItem::Bracketed(x) => {
+                let mut cls = self.hir_class_set_unicode(&x.kind)?;
+                self.unicode_fold_and_negate(&x.span, x.negated, &mut cls)?;
+                Ok(cls)
+            }
+            ast::ClassSetItem::Union(x) => {
+                let mut cls = hir::ClassUnicode::empty();
+                for item in &x.items {
+                    let item_cls = self.hir_class_set_item_unicode(item)?;
+                    cls.union(&item_cls);
+                }
+                Ok(cls)
+            }
+        }
+    }
+
+    /// Translate a ClassSetItem to a byte class.
+    fn hir_class_set_item_bytes(&self, item: &ast::ClassSetItem) -> Result<hir::ClassBytes> {
+        match item {
+            ast::ClassSetItem::Empty(_) => Ok(hir::ClassBytes::empty()),
+            ast::ClassSetItem::Literal(x) => {
+                let mut cls = hir::ClassBytes::empty();
+                let byte = self.class_literal_byte(x)?;
+                cls.push(hir::ClassBytesRange::new(byte, byte));
+                Ok(cls)
+            }
+            ast::ClassSetItem::Range(x) => {
+                let mut cls = hir::ClassBytes::empty();
+                let start = self.class_literal_byte(&x.start)?;
+                let end = self.class_literal_byte(&x.end)?;
+                cls.push(hir::ClassBytesRange::new(start, end));
+                Ok(cls)
+            }
+            ast::ClassSetItem::Ascii(x) => self.hir_ascii_byte_class(x),
+            ast::ClassSetItem::Unicode(x) => {
+                Err(self.error(x.span, ErrorKind::UnicodeNotAllowed))
+            }
+            ast::ClassSetItem::Perl(x) => self.hir_perl_byte_class(x),
+            ast::ClassSetItem::Bracketed(x) => {
+                let mut cls = self.hir_class_set_bytes(&x.kind)?;
+                self.bytes_fold_and_negate(&x.span, x.negated, &mut cls)?;
+                Ok(cls)
+            }
+            ast::ClassSetItem::Union(x) => {
+                let mut cls = hir::ClassBytes::empty();
+                for item in &x.items {
+                    let item_cls = self.hir_class_set_item_bytes(item)?;
+                    cls.union(&item_cls);
+                }
+                Ok(cls)
+            }
+        }
+    }
+
+    /// Translate a binary class set operation to a Unicode class.
+    fn hir_class_binary_op_unicode(&self, op: &ast::ClassSetBinaryOp) -> Result<hir::ClassUnicode> {
+        use crate::ast::ClassSetBinaryOpKind::*;
+
+        let mut lhs = self.hir_class_set_unicode(&op.lhs)?;
+        let mut rhs = self.hir_class_set_unicode(&op.rhs)?;
+
+        if self.flags().case_insensitive() {
+            lhs.try_case_fold_simple().map_err(|_| {
+                self.error(op.lhs.span().clone(), ErrorKind::UnicodeCaseUnavailable)
+            })?;
+            rhs.try_case_fold_simple().map_err(|_| {
+                self.error(op.rhs.span().clone(), ErrorKind::UnicodeCaseUnavailable)
+            })?;
+        }
+
+        match op.kind {
+            Intersection => lhs.intersect(&rhs),
+            Difference => lhs.difference(&rhs),
+            SymmetricDifference => lhs.symmetric_difference(&rhs),
+        }
+        Ok(lhs)
+    }
+
+    /// Translate a binary class set operation to a byte class.
+    fn hir_class_binary_op_bytes(&self, op: &ast::ClassSetBinaryOp) -> Result<hir::ClassBytes> {
+        use crate::ast::ClassSetBinaryOpKind::*;
+
+        let mut lhs = self.hir_class_set_bytes(&op.lhs)?;
+        let mut rhs = self.hir_class_set_bytes(&op.rhs)?;
+
+        if self.flags().case_insensitive() {
+            lhs.case_fold_simple();
+            rhs.case_fold_simple();
+        }
+
+        match op.kind {
+            Intersection => lhs.intersect(&rhs),
+            Difference => lhs.difference(&rhs),
+            SymmetricDifference => lhs.symmetric_difference(&rhs),
+        }
+        Ok(lhs)
     }
 
     /// Convert an Ast literal to its scalar representation.
@@ -981,45 +717,6 @@ impl<'t, 'p> TranslatorI<'t, 'p> {
             } else {
                 hir::Look::WordEndHalfAscii
             }),
-        })
-    }
-
-    fn hir_capture(&self, group: &ast::Group, expr: Hir) -> Hir {
-        let (index, name) = match group.kind {
-            ast::GroupKind::CaptureIndex(index) => (index, None),
-            ast::GroupKind::CaptureName { ref name, .. } => {
-                (name.index, Some(name.name.clone().into_boxed_str()))
-            }
-            // The HIR doesn't need to use non-capturing groups, since the way
-            // in which the data type is defined handles this automatically.
-            ast::GroupKind::NonCapturing(_) => return expr,
-        };
-        Hir::capture(hir::Capture { index, name, sub: Box::new(expr) })
-    }
-
-    fn hir_repetition(&self, rep: &ast::Repetition, expr: Hir) -> Hir {
-        let (min, max) = match rep.op.kind {
-            ast::RepetitionKind::ZeroOrOne => (0, Some(1)),
-            ast::RepetitionKind::ZeroOrMore => (0, None),
-            ast::RepetitionKind::OneOrMore => (1, None),
-            ast::RepetitionKind::Range(ast::RepetitionRange::Exactly(m)) => {
-                (m, Some(m))
-            }
-            ast::RepetitionKind::Range(ast::RepetitionRange::AtLeast(m)) => {
-                (m, None)
-            }
-            ast::RepetitionKind::Range(ast::RepetitionRange::Bounded(
-                m,
-                n,
-            )) => (m, Some(n)),
-        };
-        let greedy =
-            if self.flags().swap_greed() { !rep.greedy } else { rep.greedy };
-        Hir::repetition(hir::Repetition {
-            min,
-            max,
-            greedy,
-            sub: Box::new(expr),
         })
     }
 

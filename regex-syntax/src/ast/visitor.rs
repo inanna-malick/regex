@@ -161,8 +161,9 @@ pub enum ClassSetFrame<A> {
     Perl(ast::ClassPerl),
     /// A nested bracketed class.
     Bracketed {
-        /// Span and negation info.
+        /// Span of the bracketed class.
         span: Span,
+        /// Whether this class is negated.
         negated: bool,
         /// The contents of the nested class (already collapsed).
         child: A,
@@ -270,7 +271,9 @@ pub fn project_class_set_item(item: &ast::ClassSetItem) -> ClassSetFrame<ClassSe
 /// A child reference in a ClassSet traversal - either an Item or a Set.
 #[derive(Clone, Debug)]
 pub enum ClassSetChild<'a> {
+    /// A ClassSetItem child.
     Item(&'a ast::ClassSetItem),
+    /// A ClassSet child.
     Set(&'a ast::ClassSet),
 }
 
@@ -280,7 +283,9 @@ pub enum ClassSetChild<'a> {
 /// down to children; during collapse, each frame has its context available.
 #[derive(Clone, Debug)]
 pub struct WithContext<F, C> {
+    /// The frame being wrapped.
     pub frame: F,
+    /// The context associated with this frame.
     pub context: C,
 }
 

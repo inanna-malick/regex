@@ -4,11 +4,11 @@ This module provides a regular expression printer for `Ast`.
 
 use core::fmt;
 
-use alloc::{format, string::String};
+use alloc::{format, string::{String, ToString}};
 
-use recursion::{expand_and_collapse, MappableFrame, PartiallyApplied};
+use recursion::{expand_and_collapse, PartiallyApplied};
 
-use crate::ast::{self, visitor::{AstFrame, ClassSetFrame, project_ast}, Ast};
+use crate::ast::{self, visitor::{AstFrame, project_ast}, Ast};
 
 /// A printer for a regular expression abstract syntax tree.
 ///
@@ -55,7 +55,7 @@ fn print_ast(ast: &Ast) -> String {
             AstFrame::ClassUnicode(x) => fmt_class_unicode(&x),
             AstFrame::ClassBracketed(x) => fmt_class_bracketed(&x),
             AstFrame::Repetition { op, greedy, child, .. } => {
-                let mut s = child;
+                let mut s: String = child;
                 s.push_str(&fmt_repetition_op(&op, greedy));
                 s
             }
