@@ -1021,7 +1021,7 @@ impl<'s, P: Borrow<Parser>> ParserI<'s, P> {
             }
         }
         let ast = self.pop_group_end(concat)?;
-        NestLimiter::new(self).check(&ast)?;
+        check_nest_limit(self, &ast)?;
         Ok(ast::WithComments {
             ast,
             comments: mem::replace(
@@ -2260,157 +2260,136 @@ impl<'s, P: Borrow<Parser>> ParserI<'s, P> {
     }
 }
 
-/// A type that traverses a fully parsed Ast and checks whether its depth
-/// exceeds the specified nesting limit. If it does, then an error is returned.
-#[derive(Debug)]
-struct NestLimiter<'p, 's, P> {
-    /// The parser that is checking the nest limit.
-    p: &'p ParserI<'s, P>,
-    /// The current depth while walking an Ast.
+/// Check that the AST's nesting depth doesn't exceed the limit.
+///
+/// Uses recursion crate's stack-safe traversal with depth threaded through
+/// the seed type (flags-in-seed pattern).
+fn check_nest_limit<P: Borrow<Parser>>(
+    p: &ParserI<'_, P>,
+    ast: &Ast,
+) -> Result<()> {
+    use ast::visitor::{AstFrame, project_ast};
+    use recursion::{try_expand_and_collapse, MappableFrame, PartiallyApplied};
+
+    let limit = p.parser().nest_limit;
+
+    // Seed type: (&Ast, depth)
+    // During expand, we check depth and increment for recursive nodes
+    try_expand_and_collapse::<AstFrame<PartiallyApplied>, _, _, _>(
+        (ast, 0u32),
+        |(node, depth)| {
+            // Check if this node increases depth
+            let (span, is_recursive) = match node {
+                Ast::Empty(_)
+                | Ast::Flags(_)
+                | Ast::Literal(_)
+                | Ast::Dot(_)
+                | Ast::Assertion(_)
+                | Ast::ClassUnicode(_)
+                | Ast::ClassPerl(_) => (None, false),
+                Ast::ClassBracketed(ref x) => (Some(&x.span), true),
+                Ast::Repetition(ref x) => (Some(&x.span), true),
+                Ast::Group(ref x) => (Some(&x.span), true),
+                Ast::Alternation(ref x) => (Some(&x.span), true),
+                Ast::Concat(ref x) => (Some(&x.span), true),
+            };
+
+            let child_depth = if is_recursive {
+                let new_depth = depth.checked_add(1).ok_or_else(|| {
+                    p.error(span.unwrap().clone(), ast::ErrorKind::NestLimitExceeded(u32::MAX))
+                })?;
+                if new_depth > limit {
+                    return Err(p.error(
+                        span.unwrap().clone(),
+                        ast::ErrorKind::NestLimitExceeded(limit),
+                    ));
+                }
+                new_depth
+            } else {
+                depth
+            };
+
+            // For ClassBracketed, we also need to check the nested class set
+            if let Ast::ClassBracketed(ref class) = node {
+                check_class_set_nest_limit(p, &class.kind, child_depth, limit)?;
+            }
+
+            // Project and attach child depth
+            let frame = project_ast(node);
+            Ok(AstFrame::map_frame(frame, |child| (child, child_depth)))
+        },
+        |_frame| Ok(()), // During collapse, we don't care - just return ()
+    )
+}
+
+/// Check nest limit for a ClassSet (character class internals).
+fn check_class_set_nest_limit<P: Borrow<Parser>>(
+    p: &ParserI<'_, P>,
+    set: &ast::ClassSet,
     depth: u32,
-}
-
-impl<'p, 's, P: Borrow<Parser>> NestLimiter<'p, 's, P> {
-    fn new(p: &'p ParserI<'s, P>) -> NestLimiter<'p, 's, P> {
-        NestLimiter { p, depth: 0 }
-    }
-
-    #[inline(never)]
-    fn check(self, ast: &Ast) -> Result<()> {
-        ast::visit(ast, self)
-    }
-
-    fn increment_depth(&mut self, span: &Span) -> Result<()> {
-        let new = self.depth.checked_add(1).ok_or_else(|| {
-            self.p.error(
-                span.clone(),
-                ast::ErrorKind::NestLimitExceeded(u32::MAX),
-            )
-        })?;
-        let limit = self.p.parser().nest_limit;
-        if new > limit {
-            return Err(self.p.error(
-                span.clone(),
-                ast::ErrorKind::NestLimitExceeded(limit),
-            ));
+    limit: u32,
+) -> Result<()> {
+    match set {
+        ast::ClassSet::Item(item) => check_class_set_item_nest_limit(p, item, depth, limit),
+        ast::ClassSet::BinaryOp(op) => {
+            // Binary ops increase depth
+            let new_depth = depth.checked_add(1).ok_or_else(|| {
+                p.error(op.span.clone(), ast::ErrorKind::NestLimitExceeded(u32::MAX))
+            })?;
+            if new_depth > limit {
+                return Err(p.error(
+                    op.span.clone(),
+                    ast::ErrorKind::NestLimitExceeded(limit),
+                ));
+            }
+            check_class_set_nest_limit(p, &op.lhs, new_depth, limit)?;
+            check_class_set_nest_limit(p, &op.rhs, new_depth, limit)?;
+            Ok(())
         }
-        self.depth = new;
-        Ok(())
-    }
-
-    fn decrement_depth(&mut self) {
-        // Assuming the correctness of the visitor, this should never drop
-        // below 0.
-        self.depth = self.depth.checked_sub(1).unwrap();
     }
 }
 
-impl<'p, 's, P: Borrow<Parser>> ast::Visitor for NestLimiter<'p, 's, P> {
-    type Output = ();
-    type Err = ast::Error;
-
-    fn finish(self) -> Result<()> {
-        Ok(())
-    }
-
-    fn visit_pre(&mut self, ast: &Ast) -> Result<()> {
-        let span = match *ast {
-            Ast::Empty(_)
-            | Ast::Flags(_)
-            | Ast::Literal(_)
-            | Ast::Dot(_)
-            | Ast::Assertion(_)
-            | Ast::ClassUnicode(_)
-            | Ast::ClassPerl(_) => {
-                // These are all base cases, so we don't increment depth.
-                return Ok(());
+/// Check nest limit for a ClassSetItem.
+fn check_class_set_item_nest_limit<P: Borrow<Parser>>(
+    p: &ParserI<'_, P>,
+    item: &ast::ClassSetItem,
+    depth: u32,
+    limit: u32,
+) -> Result<()> {
+    match item {
+        ast::ClassSetItem::Empty(_)
+        | ast::ClassSetItem::Literal(_)
+        | ast::ClassSetItem::Range(_)
+        | ast::ClassSetItem::Ascii(_)
+        | ast::ClassSetItem::Unicode(_)
+        | ast::ClassSetItem::Perl(_) => Ok(()),
+        ast::ClassSetItem::Bracketed(ref b) => {
+            let new_depth = depth.checked_add(1).ok_or_else(|| {
+                p.error(b.span.clone(), ast::ErrorKind::NestLimitExceeded(u32::MAX))
+            })?;
+            if new_depth > limit {
+                return Err(p.error(
+                    b.span.clone(),
+                    ast::ErrorKind::NestLimitExceeded(limit),
+                ));
             }
-            Ast::ClassBracketed(ref x) => &x.span,
-            Ast::Repetition(ref x) => &x.span,
-            Ast::Group(ref x) => &x.span,
-            Ast::Alternation(ref x) => &x.span,
-            Ast::Concat(ref x) => &x.span,
-        };
-        self.increment_depth(span)
-    }
-
-    fn visit_post(&mut self, ast: &Ast) -> Result<()> {
-        match *ast {
-            Ast::Empty(_)
-            | Ast::Flags(_)
-            | Ast::Literal(_)
-            | Ast::Dot(_)
-            | Ast::Assertion(_)
-            | Ast::ClassUnicode(_)
-            | Ast::ClassPerl(_) => {
-                // These are all base cases, so we don't decrement depth.
-                Ok(())
-            }
-            Ast::ClassBracketed(_)
-            | Ast::Repetition(_)
-            | Ast::Group(_)
-            | Ast::Alternation(_)
-            | Ast::Concat(_) => {
-                self.decrement_depth();
-                Ok(())
-            }
+            check_class_set_nest_limit(p, &b.kind, new_depth, limit)
         }
-    }
-
-    fn visit_class_set_item_pre(
-        &mut self,
-        ast: &ast::ClassSetItem,
-    ) -> Result<()> {
-        let span = match *ast {
-            ast::ClassSetItem::Empty(_)
-            | ast::ClassSetItem::Literal(_)
-            | ast::ClassSetItem::Range(_)
-            | ast::ClassSetItem::Ascii(_)
-            | ast::ClassSetItem::Unicode(_)
-            | ast::ClassSetItem::Perl(_) => {
-                // These are all base cases, so we don't increment depth.
-                return Ok(());
+        ast::ClassSetItem::Union(ref u) => {
+            let new_depth = depth.checked_add(1).ok_or_else(|| {
+                p.error(u.span.clone(), ast::ErrorKind::NestLimitExceeded(u32::MAX))
+            })?;
+            if new_depth > limit {
+                return Err(p.error(
+                    u.span.clone(),
+                    ast::ErrorKind::NestLimitExceeded(limit),
+                ));
             }
-            ast::ClassSetItem::Bracketed(ref x) => &x.span,
-            ast::ClassSetItem::Union(ref x) => &x.span,
-        };
-        self.increment_depth(span)
-    }
-
-    fn visit_class_set_item_post(
-        &mut self,
-        ast: &ast::ClassSetItem,
-    ) -> Result<()> {
-        match *ast {
-            ast::ClassSetItem::Empty(_)
-            | ast::ClassSetItem::Literal(_)
-            | ast::ClassSetItem::Range(_)
-            | ast::ClassSetItem::Ascii(_)
-            | ast::ClassSetItem::Unicode(_)
-            | ast::ClassSetItem::Perl(_) => {
-                // These are all base cases, so we don't decrement depth.
-                Ok(())
+            for item in &u.items {
+                check_class_set_item_nest_limit(p, item, new_depth, limit)?;
             }
-            ast::ClassSetItem::Bracketed(_) | ast::ClassSetItem::Union(_) => {
-                self.decrement_depth();
-                Ok(())
-            }
+            Ok(())
         }
-    }
-
-    fn visit_class_set_binary_op_pre(
-        &mut self,
-        ast: &ast::ClassSetBinaryOp,
-    ) -> Result<()> {
-        self.increment_depth(&ast.span)
-    }
-
-    fn visit_class_set_binary_op_post(
-        &mut self,
-        _ast: &ast::ClassSetBinaryOp,
-    ) -> Result<()> {
-        self.decrement_depth();
-        Ok(())
     }
 }
 

@@ -7,11 +7,13 @@ use core::cell::{Cell, RefCell};
 use alloc::{boxed::Box, string::ToString, vec, vec::Vec};
 
 use crate::{
-    ast::{self, Ast, Span, Visitor},
+    ast::{self, visitor::{AstFrame, project_ast}, Ast, Span},
     either::Either,
     hir::{self, Error, ErrorKind, Hir, HirKind},
     unicode::{self, ClassQuery},
 };
+
+use recursion::{try_expand_and_collapse, MappableFrame, PartiallyApplied};
 
 type Result<T> = core::result::Result<T, Error>;
 

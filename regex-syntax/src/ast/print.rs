@@ -4,36 +4,11 @@ This module provides a regular expression printer for `Ast`.
 
 use core::fmt;
 
-use crate::ast::{
-    self,
-    visitor::{self, Visitor},
-    Ast,
-};
+use alloc::{format, string::String};
 
-/// A builder for constructing a printer.
-///
-/// Note that since a printer doesn't have any configuration knobs, this type
-/// remains unexported.
-#[derive(Clone, Debug)]
-struct PrinterBuilder {
-    _priv: (),
-}
+use recursion::{expand_and_collapse, MappableFrame, PartiallyApplied};
 
-impl Default for PrinterBuilder {
-    fn default() -> PrinterBuilder {
-        PrinterBuilder::new()
-    }
-}
-
-impl PrinterBuilder {
-    fn new() -> PrinterBuilder {
-        PrinterBuilder { _priv: () }
-    }
-
-    fn build(&self) -> Printer {
-        Printer { _priv: () }
-    }
-}
+use crate::ast::{self, visitor::{AstFrame, ClassSetFrame, project_ast}, Ast};
 
 /// A printer for a regular expression abstract syntax tree.
 ///
@@ -52,356 +27,289 @@ pub struct Printer {
 impl Printer {
     /// Create a new printer.
     pub fn new() -> Printer {
-        PrinterBuilder::new().build()
+        Printer { _priv: () }
     }
 
     /// Print the given `Ast` to the given writer. The writer must implement
     /// `fmt::Write`. Typical implementations of `fmt::Write` that can be used
     /// here are a `fmt::Formatter` (which is available in `fmt::Display`
     /// implementations) or a `&mut String`.
-    pub fn print<W: fmt::Write>(&mut self, ast: &Ast, wtr: W) -> fmt::Result {
-        visitor::visit(ast, Writer { wtr })
+    pub fn print<W: fmt::Write>(&mut self, ast: &Ast, mut wtr: W) -> fmt::Result {
+        let result = print_ast(ast);
+        wtr.write_str(&result)
     }
 }
 
-#[derive(Debug)]
-struct Writer<W> {
-    wtr: W,
+/// Print an AST to a string using the recursion crate's stack-safe traversal.
+fn print_ast(ast: &Ast) -> String {
+    expand_and_collapse::<AstFrame<PartiallyApplied>, _, _>(
+        ast,
+        |node| project_ast(node),
+        |frame| match frame {
+            AstFrame::Empty(_) => String::new(),
+            AstFrame::Flags(x) => fmt_set_flags(&x),
+            AstFrame::Literal(x) => fmt_literal(&x),
+            AstFrame::Dot(_) => ".".to_string(),
+            AstFrame::Assertion(x) => fmt_assertion(&x),
+            AstFrame::ClassPerl(x) => fmt_class_perl(&x),
+            AstFrame::ClassUnicode(x) => fmt_class_unicode(&x),
+            AstFrame::ClassBracketed(x) => fmt_class_bracketed(&x),
+            AstFrame::Repetition { op, greedy, child, .. } => {
+                let mut s = child;
+                s.push_str(&fmt_repetition_op(&op, greedy));
+                s
+            }
+            AstFrame::Group { kind, child, .. } => {
+                let mut s = fmt_group_open(&kind);
+                s.push_str(&child);
+                s.push(')');
+                s
+            }
+            AstFrame::Concat { children, .. } => {
+                children.into_iter().collect()
+            }
+            AstFrame::Alternation { children, .. } => {
+                children.join("|")
+            }
+        },
+    )
 }
 
-impl<W: fmt::Write> Visitor for Writer<W> {
-    type Output = ();
-    type Err = fmt::Error;
-
-    fn finish(self) -> fmt::Result {
-        Ok(())
-    }
-
-    fn visit_pre(&mut self, ast: &Ast) -> fmt::Result {
-        match *ast {
-            Ast::Group(ref x) => self.fmt_group_pre(x),
-            Ast::ClassBracketed(ref x) => self.fmt_class_bracketed_pre(x),
-            _ => Ok(()),
-        }
-    }
-
-    fn visit_post(&mut self, ast: &Ast) -> fmt::Result {
-        match *ast {
-            Ast::Empty(_) => Ok(()),
-            Ast::Flags(ref x) => self.fmt_set_flags(x),
-            Ast::Literal(ref x) => self.fmt_literal(x),
-            Ast::Dot(_) => self.wtr.write_str("."),
-            Ast::Assertion(ref x) => self.fmt_assertion(x),
-            Ast::ClassPerl(ref x) => self.fmt_class_perl(x),
-            Ast::ClassUnicode(ref x) => self.fmt_class_unicode(x),
-            Ast::ClassBracketed(ref x) => self.fmt_class_bracketed_post(x),
-            Ast::Repetition(ref x) => self.fmt_repetition(x),
-            Ast::Group(ref x) => self.fmt_group_post(x),
-            Ast::Alternation(_) => Ok(()),
-            Ast::Concat(_) => Ok(()),
-        }
-    }
-
-    fn visit_alternation_in(&mut self) -> fmt::Result {
-        self.wtr.write_str("|")
-    }
-
-    fn visit_class_set_item_pre(
-        &mut self,
-        ast: &ast::ClassSetItem,
-    ) -> Result<(), Self::Err> {
-        match *ast {
-            ast::ClassSetItem::Bracketed(ref x) => {
-                self.fmt_class_bracketed_pre(x)
+fn fmt_group_open(kind: &ast::GroupKind) -> String {
+    use ast::GroupKind::*;
+    match kind {
+        CaptureIndex(_) => "(".to_string(),
+        CaptureName { ref name, starts_with_p } => {
+            if *starts_with_p {
+                format!("(?P<{}>", name.name)
+            } else {
+                format!("(?<{}>", name.name)
             }
-            _ => Ok(()),
         }
-    }
-
-    fn visit_class_set_item_post(
-        &mut self,
-        ast: &ast::ClassSetItem,
-    ) -> Result<(), Self::Err> {
-        use crate::ast::ClassSetItem::*;
-
-        match *ast {
-            Empty(_) => Ok(()),
-            Literal(ref x) => self.fmt_literal(x),
-            Range(ref x) => {
-                self.fmt_literal(&x.start)?;
-                self.wtr.write_str("-")?;
-                self.fmt_literal(&x.end)?;
-                Ok(())
-            }
-            Ascii(ref x) => self.fmt_class_ascii(x),
-            Unicode(ref x) => self.fmt_class_unicode(x),
-            Perl(ref x) => self.fmt_class_perl(x),
-            Bracketed(ref x) => self.fmt_class_bracketed_post(x),
-            Union(_) => Ok(()),
+        NonCapturing(ref flags) => {
+            format!("(?{}:", fmt_flags(flags))
         }
-    }
-
-    fn visit_class_set_binary_op_in(
-        &mut self,
-        ast: &ast::ClassSetBinaryOp,
-    ) -> Result<(), Self::Err> {
-        self.fmt_class_set_binary_op_kind(&ast.kind)
     }
 }
 
-impl<W: fmt::Write> Writer<W> {
-    fn fmt_group_pre(&mut self, ast: &ast::Group) -> fmt::Result {
-        use crate::ast::GroupKind::*;
-        match ast.kind {
-            CaptureIndex(_) => self.wtr.write_str("("),
-            CaptureName { ref name, starts_with_p } => {
-                let start = if starts_with_p { "(?P<" } else { "(?<" };
-                self.wtr.write_str(start)?;
-                self.wtr.write_str(&name.name)?;
-                self.wtr.write_str(">")?;
-                Ok(())
-            }
-            NonCapturing(ref flags) => {
-                self.wtr.write_str("(?")?;
-                self.fmt_flags(flags)?;
-                self.wtr.write_str(":")?;
-                Ok(())
-            }
+fn fmt_repetition_op(op: &ast::RepetitionOp, greedy: bool) -> String {
+    use ast::RepetitionKind::*;
+    match op.kind {
+        ZeroOrOne if greedy => "?".to_string(),
+        ZeroOrOne => "??".to_string(),
+        ZeroOrMore if greedy => "*".to_string(),
+        ZeroOrMore => "*?".to_string(),
+        OneOrMore if greedy => "+".to_string(),
+        OneOrMore => "+?".to_string(),
+        Range(ref x) => {
+            let base = fmt_repetition_range(x);
+            if greedy { base } else { format!("{}?", base) }
         }
     }
+}
 
-    fn fmt_group_post(&mut self, _ast: &ast::Group) -> fmt::Result {
-        self.wtr.write_str(")")
+fn fmt_repetition_range(ast: &ast::RepetitionRange) -> String {
+    use ast::RepetitionRange::*;
+    match *ast {
+        Exactly(x) => format!("{{{}}}", x),
+        AtLeast(x) => format!("{{{},}}", x),
+        Bounded(x, y) => format!("{{{},{}}}", x, y),
     }
+}
 
-    fn fmt_repetition(&mut self, ast: &ast::Repetition) -> fmt::Result {
-        use crate::ast::RepetitionKind::*;
-        match ast.op.kind {
-            ZeroOrOne if ast.greedy => self.wtr.write_str("?"),
-            ZeroOrOne => self.wtr.write_str("??"),
-            ZeroOrMore if ast.greedy => self.wtr.write_str("*"),
-            ZeroOrMore => self.wtr.write_str("*?"),
-            OneOrMore if ast.greedy => self.wtr.write_str("+"),
-            OneOrMore => self.wtr.write_str("+?"),
-            Range(ref x) => {
-                self.fmt_repetition_range(x)?;
-                if !ast.greedy {
-                    self.wtr.write_str("?")?;
-                }
-                Ok(())
-            }
+fn fmt_literal(ast: &ast::Literal) -> String {
+    use ast::LiteralKind::*;
+
+    match ast.kind {
+        Verbatim => ast.c.to_string(),
+        Meta | Superfluous => format!(r"\{}", ast.c),
+        Octal => format!(r"\{:o}", u32::from(ast.c)),
+        HexFixed(ast::HexLiteralKind::X) => {
+            format!(r"\x{:02X}", u32::from(ast.c))
+        }
+        HexFixed(ast::HexLiteralKind::UnicodeShort) => {
+            format!(r"\u{:04X}", u32::from(ast.c))
+        }
+        HexFixed(ast::HexLiteralKind::UnicodeLong) => {
+            format!(r"\U{:08X}", u32::from(ast.c))
+        }
+        HexBrace(ast::HexLiteralKind::X) => {
+            format!(r"\x{{{:X}}}", u32::from(ast.c))
+        }
+        HexBrace(ast::HexLiteralKind::UnicodeShort) => {
+            format!(r"\u{{{:X}}}", u32::from(ast.c))
+        }
+        HexBrace(ast::HexLiteralKind::UnicodeLong) => {
+            format!(r"\U{{{:X}}}", u32::from(ast.c))
+        }
+        Special(ast::SpecialLiteralKind::Bell) => r"\a".to_string(),
+        Special(ast::SpecialLiteralKind::FormFeed) => r"\f".to_string(),
+        Special(ast::SpecialLiteralKind::Tab) => r"\t".to_string(),
+        Special(ast::SpecialLiteralKind::LineFeed) => r"\n".to_string(),
+        Special(ast::SpecialLiteralKind::CarriageReturn) => r"\r".to_string(),
+        Special(ast::SpecialLiteralKind::VerticalTab) => r"\v".to_string(),
+        Special(ast::SpecialLiteralKind::Space) => r"\ ".to_string(),
+    }
+}
+
+fn fmt_assertion(ast: &ast::Assertion) -> String {
+    use ast::AssertionKind::*;
+    match ast.kind {
+        StartLine => "^".to_string(),
+        EndLine => "$".to_string(),
+        StartText => r"\A".to_string(),
+        EndText => r"\z".to_string(),
+        WordBoundary => r"\b".to_string(),
+        NotWordBoundary => r"\B".to_string(),
+        WordBoundaryStart => r"\b{start}".to_string(),
+        WordBoundaryEnd => r"\b{end}".to_string(),
+        WordBoundaryStartAngle => r"\<".to_string(),
+        WordBoundaryEndAngle => r"\>".to_string(),
+        WordBoundaryStartHalf => r"\b{start-half}".to_string(),
+        WordBoundaryEndHalf => r"\b{end-half}".to_string(),
+    }
+}
+
+fn fmt_set_flags(ast: &ast::SetFlags) -> String {
+    format!("(?{})", fmt_flags(&ast.flags))
+}
+
+fn fmt_flags(ast: &ast::Flags) -> String {
+    use ast::{Flag, FlagsItemKind};
+
+    let mut s = String::new();
+    for item in &ast.items {
+        match item.kind {
+            FlagsItemKind::Negation => s.push('-'),
+            FlagsItemKind::Flag(ref flag) => match *flag {
+                Flag::CaseInsensitive => s.push('i'),
+                Flag::MultiLine => s.push('m'),
+                Flag::DotMatchesNewLine => s.push('s'),
+                Flag::SwapGreed => s.push('U'),
+                Flag::Unicode => s.push('u'),
+                Flag::CRLF => s.push('R'),
+                Flag::IgnoreWhitespace => s.push('x'),
+            },
         }
     }
+    s
+}
 
-    fn fmt_repetition_range(
-        &mut self,
-        ast: &ast::RepetitionRange,
-    ) -> fmt::Result {
-        use crate::ast::RepetitionRange::*;
-        match *ast {
-            Exactly(x) => write!(self.wtr, "{{{x}}}"),
-            AtLeast(x) => write!(self.wtr, "{{{x},}}"),
-            Bounded(x, y) => write!(self.wtr, "{{{x},{y}}}"),
+fn fmt_class_bracketed(ast: &ast::ClassBracketed) -> String {
+    let mut s = if ast.negated {
+        "[^".to_string()
+    } else {
+        "[".to_string()
+    };
+    s.push_str(&fmt_class_set(&ast.kind));
+    s.push(']');
+    s
+}
+
+fn fmt_class_set(set: &ast::ClassSet) -> String {
+    match set {
+        ast::ClassSet::Item(item) => fmt_class_set_item(item),
+        ast::ClassSet::BinaryOp(op) => fmt_class_set_binary_op(op),
+    }
+}
+
+fn fmt_class_set_item(item: &ast::ClassSetItem) -> String {
+    use ast::ClassSetItem::*;
+    match item {
+        Empty(_) => String::new(),
+        Literal(x) => fmt_literal(x),
+        Range(x) => {
+            format!("{}-{}", fmt_literal(&x.start), fmt_literal(&x.end))
+        }
+        Ascii(x) => fmt_class_ascii(x),
+        Unicode(x) => fmt_class_unicode(x),
+        Perl(x) => fmt_class_perl(x),
+        Bracketed(x) => fmt_class_bracketed(x),
+        Union(x) => {
+            x.items.iter().map(fmt_class_set_item).collect()
         }
     }
+}
 
-    fn fmt_literal(&mut self, ast: &ast::Literal) -> fmt::Result {
-        use crate::ast::LiteralKind::*;
+fn fmt_class_set_binary_op(op: &ast::ClassSetBinaryOp) -> String {
+    let lhs = fmt_class_set(&op.lhs);
+    let rhs = fmt_class_set(&op.rhs);
+    let op_str = match op.kind {
+        ast::ClassSetBinaryOpKind::Intersection => "&&",
+        ast::ClassSetBinaryOpKind::Difference => "--",
+        ast::ClassSetBinaryOpKind::SymmetricDifference => "~~",
+    };
+    format!("{}{}{}", lhs, op_str, rhs)
+}
 
-        match ast.kind {
-            Verbatim => self.wtr.write_char(ast.c),
-            Meta | Superfluous => write!(self.wtr, r"\{}", ast.c),
-            Octal => write!(self.wtr, r"\{:o}", u32::from(ast.c)),
-            HexFixed(ast::HexLiteralKind::X) => {
-                write!(self.wtr, r"\x{:02X}", u32::from(ast.c))
-            }
-            HexFixed(ast::HexLiteralKind::UnicodeShort) => {
-                write!(self.wtr, r"\u{:04X}", u32::from(ast.c))
-            }
-            HexFixed(ast::HexLiteralKind::UnicodeLong) => {
-                write!(self.wtr, r"\U{:08X}", u32::from(ast.c))
-            }
-            HexBrace(ast::HexLiteralKind::X) => {
-                write!(self.wtr, r"\x{{{:X}}}", u32::from(ast.c))
-            }
-            HexBrace(ast::HexLiteralKind::UnicodeShort) => {
-                write!(self.wtr, r"\u{{{:X}}}", u32::from(ast.c))
-            }
-            HexBrace(ast::HexLiteralKind::UnicodeLong) => {
-                write!(self.wtr, r"\U{{{:X}}}", u32::from(ast.c))
-            }
-            Special(ast::SpecialLiteralKind::Bell) => {
-                self.wtr.write_str(r"\a")
-            }
-            Special(ast::SpecialLiteralKind::FormFeed) => {
-                self.wtr.write_str(r"\f")
-            }
-            Special(ast::SpecialLiteralKind::Tab) => self.wtr.write_str(r"\t"),
-            Special(ast::SpecialLiteralKind::LineFeed) => {
-                self.wtr.write_str(r"\n")
-            }
-            Special(ast::SpecialLiteralKind::CarriageReturn) => {
-                self.wtr.write_str(r"\r")
-            }
-            Special(ast::SpecialLiteralKind::VerticalTab) => {
-                self.wtr.write_str(r"\v")
-            }
-            Special(ast::SpecialLiteralKind::Space) => {
-                self.wtr.write_str(r"\ ")
-            }
+fn fmt_class_perl(ast: &ast::ClassPerl) -> String {
+    use ast::ClassPerlKind::*;
+    match ast.kind {
+        Digit if ast.negated => r"\D".to_string(),
+        Digit => r"\d".to_string(),
+        Space if ast.negated => r"\S".to_string(),
+        Space => r"\s".to_string(),
+        Word if ast.negated => r"\W".to_string(),
+        Word => r"\w".to_string(),
+    }
+}
+
+fn fmt_class_ascii(ast: &ast::ClassAscii) -> String {
+    use ast::ClassAsciiKind::*;
+    match ast.kind {
+        Alnum if ast.negated => "[:^alnum:]".to_string(),
+        Alnum => "[:alnum:]".to_string(),
+        Alpha if ast.negated => "[:^alpha:]".to_string(),
+        Alpha => "[:alpha:]".to_string(),
+        Ascii if ast.negated => "[:^ascii:]".to_string(),
+        Ascii => "[:ascii:]".to_string(),
+        Blank if ast.negated => "[:^blank:]".to_string(),
+        Blank => "[:blank:]".to_string(),
+        Cntrl if ast.negated => "[:^cntrl:]".to_string(),
+        Cntrl => "[:cntrl:]".to_string(),
+        Digit if ast.negated => "[:^digit:]".to_string(),
+        Digit => "[:digit:]".to_string(),
+        Graph if ast.negated => "[:^graph:]".to_string(),
+        Graph => "[:graph:]".to_string(),
+        Lower if ast.negated => "[:^lower:]".to_string(),
+        Lower => "[:lower:]".to_string(),
+        Print if ast.negated => "[:^print:]".to_string(),
+        Print => "[:print:]".to_string(),
+        Punct if ast.negated => "[:^punct:]".to_string(),
+        Punct => "[:punct:]".to_string(),
+        Space if ast.negated => "[:^space:]".to_string(),
+        Space => "[:space:]".to_string(),
+        Upper if ast.negated => "[:^upper:]".to_string(),
+        Upper => "[:upper:]".to_string(),
+        Word if ast.negated => "[:^word:]".to_string(),
+        Word => "[:word:]".to_string(),
+        Xdigit if ast.negated => "[:^xdigit:]".to_string(),
+        Xdigit => "[:xdigit:]".to_string(),
+    }
+}
+
+fn fmt_class_unicode(ast: &ast::ClassUnicode) -> String {
+    use ast::ClassUnicodeKind::*;
+    use ast::ClassUnicodeOpKind::*;
+
+    let prefix = if ast.negated { r"\P" } else { r"\p" };
+    match &ast.kind {
+        OneLetter(c) => format!("{}{}", prefix, c),
+        Named(x) => format!("{}{{{}}}", prefix, x),
+        NamedValue { op: Equal, name, value } => {
+            format!("{}{{{}={}}}", prefix, name, value)
         }
-    }
-
-    fn fmt_assertion(&mut self, ast: &ast::Assertion) -> fmt::Result {
-        use crate::ast::AssertionKind::*;
-        match ast.kind {
-            StartLine => self.wtr.write_str("^"),
-            EndLine => self.wtr.write_str("$"),
-            StartText => self.wtr.write_str(r"\A"),
-            EndText => self.wtr.write_str(r"\z"),
-            WordBoundary => self.wtr.write_str(r"\b"),
-            NotWordBoundary => self.wtr.write_str(r"\B"),
-            WordBoundaryStart => self.wtr.write_str(r"\b{start}"),
-            WordBoundaryEnd => self.wtr.write_str(r"\b{end}"),
-            WordBoundaryStartAngle => self.wtr.write_str(r"\<"),
-            WordBoundaryEndAngle => self.wtr.write_str(r"\>"),
-            WordBoundaryStartHalf => self.wtr.write_str(r"\b{start-half}"),
-            WordBoundaryEndHalf => self.wtr.write_str(r"\b{end-half}"),
+        NamedValue { op: Colon, name, value } => {
+            format!("{}{{{}:{}}}", prefix, name, value)
         }
-    }
-
-    fn fmt_set_flags(&mut self, ast: &ast::SetFlags) -> fmt::Result {
-        self.wtr.write_str("(?")?;
-        self.fmt_flags(&ast.flags)?;
-        self.wtr.write_str(")")?;
-        Ok(())
-    }
-
-    fn fmt_flags(&mut self, ast: &ast::Flags) -> fmt::Result {
-        use crate::ast::{Flag, FlagsItemKind};
-
-        for item in &ast.items {
-            match item.kind {
-                FlagsItemKind::Negation => self.wtr.write_str("-"),
-                FlagsItemKind::Flag(ref flag) => match *flag {
-                    Flag::CaseInsensitive => self.wtr.write_str("i"),
-                    Flag::MultiLine => self.wtr.write_str("m"),
-                    Flag::DotMatchesNewLine => self.wtr.write_str("s"),
-                    Flag::SwapGreed => self.wtr.write_str("U"),
-                    Flag::Unicode => self.wtr.write_str("u"),
-                    Flag::CRLF => self.wtr.write_str("R"),
-                    Flag::IgnoreWhitespace => self.wtr.write_str("x"),
-                },
-            }?;
-        }
-        Ok(())
-    }
-
-    fn fmt_class_bracketed_pre(
-        &mut self,
-        ast: &ast::ClassBracketed,
-    ) -> fmt::Result {
-        if ast.negated {
-            self.wtr.write_str("[^")
-        } else {
-            self.wtr.write_str("[")
-        }
-    }
-
-    fn fmt_class_bracketed_post(
-        &mut self,
-        _ast: &ast::ClassBracketed,
-    ) -> fmt::Result {
-        self.wtr.write_str("]")
-    }
-
-    fn fmt_class_set_binary_op_kind(
-        &mut self,
-        ast: &ast::ClassSetBinaryOpKind,
-    ) -> fmt::Result {
-        use crate::ast::ClassSetBinaryOpKind::*;
-        match *ast {
-            Intersection => self.wtr.write_str("&&"),
-            Difference => self.wtr.write_str("--"),
-            SymmetricDifference => self.wtr.write_str("~~"),
-        }
-    }
-
-    fn fmt_class_perl(&mut self, ast: &ast::ClassPerl) -> fmt::Result {
-        use crate::ast::ClassPerlKind::*;
-        match ast.kind {
-            Digit if ast.negated => self.wtr.write_str(r"\D"),
-            Digit => self.wtr.write_str(r"\d"),
-            Space if ast.negated => self.wtr.write_str(r"\S"),
-            Space => self.wtr.write_str(r"\s"),
-            Word if ast.negated => self.wtr.write_str(r"\W"),
-            Word => self.wtr.write_str(r"\w"),
-        }
-    }
-
-    fn fmt_class_ascii(&mut self, ast: &ast::ClassAscii) -> fmt::Result {
-        use crate::ast::ClassAsciiKind::*;
-        match ast.kind {
-            Alnum if ast.negated => self.wtr.write_str("[:^alnum:]"),
-            Alnum => self.wtr.write_str("[:alnum:]"),
-            Alpha if ast.negated => self.wtr.write_str("[:^alpha:]"),
-            Alpha => self.wtr.write_str("[:alpha:]"),
-            Ascii if ast.negated => self.wtr.write_str("[:^ascii:]"),
-            Ascii => self.wtr.write_str("[:ascii:]"),
-            Blank if ast.negated => self.wtr.write_str("[:^blank:]"),
-            Blank => self.wtr.write_str("[:blank:]"),
-            Cntrl if ast.negated => self.wtr.write_str("[:^cntrl:]"),
-            Cntrl => self.wtr.write_str("[:cntrl:]"),
-            Digit if ast.negated => self.wtr.write_str("[:^digit:]"),
-            Digit => self.wtr.write_str("[:digit:]"),
-            Graph if ast.negated => self.wtr.write_str("[:^graph:]"),
-            Graph => self.wtr.write_str("[:graph:]"),
-            Lower if ast.negated => self.wtr.write_str("[:^lower:]"),
-            Lower => self.wtr.write_str("[:lower:]"),
-            Print if ast.negated => self.wtr.write_str("[:^print:]"),
-            Print => self.wtr.write_str("[:print:]"),
-            Punct if ast.negated => self.wtr.write_str("[:^punct:]"),
-            Punct => self.wtr.write_str("[:punct:]"),
-            Space if ast.negated => self.wtr.write_str("[:^space:]"),
-            Space => self.wtr.write_str("[:space:]"),
-            Upper if ast.negated => self.wtr.write_str("[:^upper:]"),
-            Upper => self.wtr.write_str("[:upper:]"),
-            Word if ast.negated => self.wtr.write_str("[:^word:]"),
-            Word => self.wtr.write_str("[:word:]"),
-            Xdigit if ast.negated => self.wtr.write_str("[:^xdigit:]"),
-            Xdigit => self.wtr.write_str("[:xdigit:]"),
-        }
-    }
-
-    fn fmt_class_unicode(&mut self, ast: &ast::ClassUnicode) -> fmt::Result {
-        use crate::ast::ClassUnicodeKind::*;
-        use crate::ast::ClassUnicodeOpKind::*;
-
-        if ast.negated {
-            self.wtr.write_str(r"\P")?;
-        } else {
-            self.wtr.write_str(r"\p")?;
-        }
-        match ast.kind {
-            OneLetter(c) => self.wtr.write_char(c),
-            Named(ref x) => write!(self.wtr, "{{{}}}", x),
-            NamedValue { op: Equal, ref name, ref value } => {
-                write!(self.wtr, "{{{}={}}}", name, value)
-            }
-            NamedValue { op: Colon, ref name, ref value } => {
-                write!(self.wtr, "{{{}:{}}}", name, value)
-            }
-            NamedValue { op: NotEqual, ref name, ref value } => {
-                write!(self.wtr, "{{{}!={}}}", name, value)
-            }
+        NamedValue { op: NotEqual, name, value } => {
+            format!("{}{{{}!={}}}", prefix, name, value)
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use alloc::string::String;
-
     use crate::ast::parse::ParserBuilder;
 
     use super::*;

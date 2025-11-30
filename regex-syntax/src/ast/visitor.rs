@@ -1,21 +1,26 @@
 /*!
 Provides a stack-safe traversal of the AST using recursion schemes.
 
-This module replaces the hand-rolled stack machine with the `recursion` crate's
-`Collapsible` pattern. The key types are:
+This module provides frame types that implement `MappableFrame` from the
+`recursion` crate, enabling stack-safe traversal via `collapse_frames`.
 
-- [`AstFrame`]: One layer of AST structure with child positions replaced by a type parameter
+Key types:
+- [`AstFrame`]: One layer of AST with child positions replaced by a type parameter
 - [`ClassSetFrame`]: One layer of character class structure
 
-These frame types implement `MappableFrame` from the recursion crate, enabling
-stack-safe traversal via `collapse_frames` and `try_collapse_frames`.
+The frame types can be used directly with the recursion crate's
+`expand_and_collapse` for custom traversals that thread context (like flags)
+through the tree.
 */
 
 use alloc::vec::Vec;
 
-use recursion::{Collapsible, CollapsibleExt, MappableFrame, PartiallyApplied};
+use recursion::{MappableFrame, PartiallyApplied};
 
 use crate::ast::{self, Ast, Span};
+
+// Re-export recursion crate primitives for use by consumers
+pub use recursion::{Collapsible, CollapsibleExt, Expandable, ExpandableExt};
 
 /// A single layer of AST structure with recursive positions replaced by `A`.
 ///
@@ -104,47 +109,38 @@ impl MappableFrame for AstFrame<PartiallyApplied> {
     }
 }
 
-/// Owned AST wrapper for Collapsible implementation.
+/// Project an AST node into a frame with children as AST references.
 ///
-/// The recursion crate requires owned values, so we clone the AST.
-/// For large ASTs, consider using a reference-based approach with
-/// explicit stack management instead.
-#[derive(Clone, Debug)]
-pub struct OwnedAst(pub Ast);
-
-impl Collapsible for OwnedAst {
-    type FrameToken = AstFrame<PartiallyApplied>;
-
-    fn into_frame(self) -> AstFrame<Self> {
-        match self.0 {
-            Ast::Empty(span) => AstFrame::Empty(*span),
-            Ast::Flags(f) => AstFrame::Flags(*f),
-            Ast::Literal(lit) => AstFrame::Literal(*lit),
-            Ast::Dot(span) => AstFrame::Dot(*span),
-            Ast::Assertion(a) => AstFrame::Assertion(*a),
-            Ast::ClassUnicode(c) => AstFrame::ClassUnicode(*c),
-            Ast::ClassPerl(c) => AstFrame::ClassPerl(*c),
-            Ast::ClassBracketed(c) => AstFrame::ClassBracketed(*c),
-            Ast::Repetition(rep) => AstFrame::Repetition {
-                span: rep.span,
-                op: rep.op.clone(),
-                greedy: rep.greedy,
-                child: OwnedAst((*rep.ast).clone()),
-            },
-            Ast::Group(g) => AstFrame::Group {
-                span: g.span,
-                kind: g.kind.clone(),
-                child: OwnedAst((*g.ast).clone()),
-            },
-            Ast::Concat(c) => AstFrame::Concat {
-                span: c.span,
-                children: c.asts.into_iter().map(OwnedAst).collect(),
-            },
-            Ast::Alternation(a) => AstFrame::Alternation {
-                span: a.span,
-                children: a.asts.into_iter().map(OwnedAst).collect(),
-            },
-        }
+/// This is the fundamental projection function used by `expand_and_collapse`.
+pub fn project_ast(ast: &Ast) -> AstFrame<&Ast> {
+    match ast {
+        Ast::Empty(span) => AstFrame::Empty(**span),
+        Ast::Flags(f) => AstFrame::Flags((**f).clone()),
+        Ast::Literal(lit) => AstFrame::Literal((**lit).clone()),
+        Ast::Dot(span) => AstFrame::Dot(**span),
+        Ast::Assertion(a) => AstFrame::Assertion((**a).clone()),
+        Ast::ClassUnicode(c) => AstFrame::ClassUnicode((**c).clone()),
+        Ast::ClassPerl(c) => AstFrame::ClassPerl((**c).clone()),
+        Ast::ClassBracketed(c) => AstFrame::ClassBracketed((**c).clone()),
+        Ast::Repetition(rep) => AstFrame::Repetition {
+            span: rep.span,
+            op: rep.op.clone(),
+            greedy: rep.greedy,
+            child: &rep.ast,
+        },
+        Ast::Group(g) => AstFrame::Group {
+            span: g.span,
+            kind: g.kind.clone(),
+            child: &g.ast,
+        },
+        Ast::Concat(c) => AstFrame::Concat {
+            span: c.span,
+            children: c.asts.iter().collect(),
+        },
+        Ast::Alternation(a) => AstFrame::Alternation {
+            span: a.span,
+            children: a.asts.iter().collect(),
+        },
     }
 }
 
@@ -215,105 +211,100 @@ impl MappableFrame for ClassSetFrame<PartiallyApplied> {
     }
 }
 
-/// Owned ClassSet wrapper for Collapsible implementation.
-#[derive(Clone, Debug)]
-pub struct OwnedClassSet(pub ast::ClassSet);
+/// Project a ClassSet into a frame.
+pub fn project_class_set(set: &ast::ClassSet) -> ClassSetFrame<&ast::ClassSet> {
+    match set {
+        ast::ClassSet::Item(item) => project_class_set_item_as_set(item),
+        ast::ClassSet::BinaryOp(op) => ClassSetFrame::BinaryOp {
+            span: op.span,
+            kind: op.kind,
+            lhs: &op.lhs,
+            rhs: &op.rhs,
+        },
+    }
+}
 
-impl Collapsible for OwnedClassSet {
-    type FrameToken = ClassSetFrame<PartiallyApplied>;
-
-    fn into_frame(self) -> ClassSetFrame<Self> {
-        match self.0 {
-            ast::ClassSet::Item(item) => class_set_item_to_frame(item),
-            ast::ClassSet::BinaryOp(op) => ClassSetFrame::BinaryOp {
-                span: op.span,
-                kind: op.kind,
-                lhs: OwnedClassSet(*op.lhs),
-                rhs: OwnedClassSet(*op.rhs),
-            },
+fn project_class_set_item_as_set(item: &ast::ClassSetItem) -> ClassSetFrame<&ast::ClassSet> {
+    // For items that aren't naturally ClassSet, we need to handle them specially.
+    // This is a bit awkward because ClassSetItem::Union contains ClassSetItems, not ClassSets.
+    // For now, we'll panic on Union - callers should use project_class_set_item instead.
+    match item {
+        ast::ClassSetItem::Empty(span) => ClassSetFrame::Empty(*span),
+        ast::ClassSetItem::Literal(lit) => ClassSetFrame::Literal(lit.clone()),
+        ast::ClassSetItem::Range(r) => ClassSetFrame::Range(r.clone()),
+        ast::ClassSetItem::Ascii(a) => ClassSetFrame::Ascii(a.clone()),
+        ast::ClassSetItem::Unicode(u) => ClassSetFrame::Unicode(u.clone()),
+        ast::ClassSetItem::Perl(p) => ClassSetFrame::Perl(p.clone()),
+        ast::ClassSetItem::Bracketed(b) => ClassSetFrame::Bracketed {
+            span: b.span,
+            negated: b.negated,
+            child: &b.kind,
+        },
+        ast::ClassSetItem::Union(_) => {
+            panic!("project_class_set_item_as_set called on Union - use dedicated traversal")
         }
     }
 }
 
-fn class_set_item_to_frame(item: ast::ClassSetItem) -> ClassSetFrame<OwnedClassSet> {
+/// Project a ClassSetItem into a frame with ClassSetItem children.
+pub fn project_class_set_item(item: &ast::ClassSetItem) -> ClassSetFrame<ClassSetChild<'_>> {
     match item {
-        ast::ClassSetItem::Empty(span) => ClassSetFrame::Empty(span),
-        ast::ClassSetItem::Literal(lit) => ClassSetFrame::Literal(lit),
-        ast::ClassSetItem::Range(r) => ClassSetFrame::Range(r),
-        ast::ClassSetItem::Ascii(a) => ClassSetFrame::Ascii(a),
-        ast::ClassSetItem::Unicode(u) => ClassSetFrame::Unicode(u),
-        ast::ClassSetItem::Perl(p) => ClassSetFrame::Perl(p),
+        ast::ClassSetItem::Empty(span) => ClassSetFrame::Empty(*span),
+        ast::ClassSetItem::Literal(lit) => ClassSetFrame::Literal(lit.clone()),
+        ast::ClassSetItem::Range(r) => ClassSetFrame::Range(r.clone()),
+        ast::ClassSetItem::Ascii(a) => ClassSetFrame::Ascii(a.clone()),
+        ast::ClassSetItem::Unicode(u) => ClassSetFrame::Unicode(u.clone()),
+        ast::ClassSetItem::Perl(p) => ClassSetFrame::Perl(p.clone()),
         ast::ClassSetItem::Bracketed(b) => ClassSetFrame::Bracketed {
             span: b.span,
             negated: b.negated,
-            child: OwnedClassSet(b.kind),
+            child: ClassSetChild::Set(&b.kind),
         },
         ast::ClassSetItem::Union(u) => ClassSetFrame::Union {
             span: u.span,
-            children: u.items.into_iter().map(|i| OwnedClassSet(ast::ClassSet::Item(i))).collect(),
+            children: u.items.iter().map(ClassSetChild::Item).collect(),
         },
     }
 }
 
-/// Collapse an AST using a provided algebra function.
-///
-/// This is the primary way to process an AST with the recursion crate.
-/// The algebra receives each node after its children have been processed,
-/// with children replaced by the results of processing them.
-///
-/// # Stack Safety
-///
-/// This function is stack-safe: it uses heap allocation proportional to the
-/// AST size rather than stack space proportional to AST depth.
-pub fn collapse_ast<Out>(
-    ast: Ast,
-    f: impl FnMut(AstFrame<Out>) -> Out,
-) -> Out {
-    OwnedAst(ast).collapse_frames(f)
+/// A child reference in a ClassSet traversal - either an Item or a Set.
+#[derive(Clone, Debug)]
+pub enum ClassSetChild<'a> {
+    Item(&'a ast::ClassSetItem),
+    Set(&'a ast::ClassSet),
 }
 
-/// Collapse an AST using a fallible algebra function.
+/// Frame wrapper that pairs a frame with context (like flags).
 ///
-/// Like [`collapse_ast`] but the algebra can return errors, which will
-/// short-circuit the traversal.
-pub fn try_collapse_ast<Out, E>(
-    ast: Ast,
-    f: impl FnMut(AstFrame<Out>) -> Result<Out, E>,
-) -> Result<Out, E> {
-    OwnedAst(ast).try_collapse_frames(f)
-}
-
-/// Collapse a ClassSet using a provided algebra function.
-pub fn collapse_class_set<Out>(
-    set: ast::ClassSet,
-    f: impl FnMut(ClassSetFrame<Out>) -> Out,
-) -> Out {
-    OwnedClassSet(set).collapse_frames(f)
-}
-
-/// Collapse a ClassSet using a fallible algebra function.
-pub fn try_collapse_class_set<Out, E>(
-    set: ast::ClassSet,
-    f: impl FnMut(ClassSetFrame<Out>) -> Result<Out, E>,
-) -> Result<Out, E> {
-    OwnedClassSet(set).try_collapse_frames(f)
+/// This enables the "flags in seed" pattern: during expansion, context flows
+/// down to children; during collapse, each frame has its context available.
+#[derive(Clone, Debug)]
+pub struct WithContext<F, C> {
+    pub frame: F,
+    pub context: C,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ast::parse::Parser;
+    use recursion::expand_and_collapse;
 
     #[test]
     fn test_count_nodes() {
         let ast = Parser::new().parse(r"a|b|c").unwrap();
-        let count = collapse_ast(ast, |frame| match frame {
-            AstFrame::Concat { children, .. } => 1 + children.into_iter().sum::<usize>(),
-            AstFrame::Alternation { children, .. } => 1 + children.into_iter().sum::<usize>(),
-            AstFrame::Repetition { child, .. } => 1 + child,
-            AstFrame::Group { child, .. } => 1 + child,
-            _ => 1,
-        });
+
+        let count = expand_and_collapse::<AstFrame<PartiallyApplied>, _, _>(
+            &ast,
+            |node| project_ast(node),
+            |frame| match frame {
+                AstFrame::Concat { children, .. } => 1 + children.into_iter().sum::<usize>(),
+                AstFrame::Alternation { children, .. } => 1 + children.into_iter().sum::<usize>(),
+                AstFrame::Repetition { child, .. } => 1 + child,
+                AstFrame::Group { child, .. } => 1 + child,
+                _ => 1,
+            },
+        );
         // a|b|c parses to Alternation with 3 Literal children
         assert_eq!(count, 4); // 1 alternation + 3 literals
     }
@@ -321,27 +312,80 @@ mod tests {
     #[test]
     fn test_depth() {
         let ast = Parser::new().parse(r"((a))").unwrap();
-        let depth = collapse_ast(ast, |frame| match frame {
-            AstFrame::Group { child, .. } => 1 + child,
-            AstFrame::Repetition { child, .. } => 1 + child,
-            AstFrame::Concat { children, .. } => {
-                children.into_iter().max().unwrap_or(0)
-            }
-            AstFrame::Alternation { children, .. } => {
-                children.into_iter().max().unwrap_or(0)
-            }
-            _ => 0,
-        });
+
+        let depth = expand_and_collapse::<AstFrame<PartiallyApplied>, _, _>(
+            &ast,
+            |node| project_ast(node),
+            |frame| match frame {
+                AstFrame::Group { child, .. } => 1 + child,
+                AstFrame::Repetition { child, .. } => 1 + child,
+                AstFrame::Concat { children, .. } => {
+                    children.into_iter().max().unwrap_or(0)
+                }
+                AstFrame::Alternation { children, .. } => {
+                    children.into_iter().max().unwrap_or(0)
+                }
+                _ => 0,
+            },
+        );
         assert_eq!(depth, 2); // Two nested groups
     }
 
     #[test]
     fn test_fallible() {
         let ast = Parser::new().parse(r"a*").unwrap();
-        let result: Result<(), &str> = try_collapse_ast(ast, |frame| match frame {
-            AstFrame::Repetition { .. } => Err("no repetitions allowed"),
-            _ => Ok(()),
-        });
+
+        let result: Result<(), &str> = recursion::try_expand_and_collapse::<AstFrame<PartiallyApplied>, _, _, _>(
+            &ast,
+            |node| Ok(project_ast(node)),
+            |frame| match frame {
+                AstFrame::Repetition { .. } => Err("no repetitions allowed"),
+                _ => Ok(()),
+            },
+        );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_with_context() {
+        // Demonstrate threading context through traversal
+        let ast = Parser::new().parse(r"(?i)a").unwrap();
+
+        #[derive(Clone, Debug, Default)]
+        struct Ctx { case_insensitive: bool }
+
+        // Count nodes, tracking if we're inside a case-insensitive group
+        let (count, _) = expand_and_collapse::<AstFrame<PartiallyApplied>, _, _>(
+            (&ast, Ctx::default()),
+            |(node, ctx)| {
+                let frame = project_ast(node);
+                // If this is a group with flags, update context for children
+                let child_ctx = match &frame {
+                    AstFrame::Group { kind: ast::GroupKind::NonCapturing(flags), .. } => {
+                        let mut new_ctx = ctx.clone();
+                        for item in &flags.items {
+                            if let ast::FlagsItemKind::Flag(ast::Flag::CaseInsensitive) = item.kind {
+                                new_ctx.case_insensitive = true;
+                            }
+                        }
+                        new_ctx
+                    }
+                    _ => ctx.clone(),
+                };
+                AstFrame::map_frame(frame, |child| (child, child_ctx.clone()))
+            },
+            |frame| match frame {
+                AstFrame::Concat { children, .. } |
+                AstFrame::Alternation { children, .. } => {
+                    let sum: usize = children.iter().map(|(c, _)| c).sum();
+                    let ctx = children.into_iter().next().map(|(_, c)| c).unwrap_or_default();
+                    (1 + sum, ctx)
+                }
+                AstFrame::Repetition { child: (c, ctx), .. } |
+                AstFrame::Group { child: (c, ctx), .. } => (1 + c, ctx),
+                _ => (1, Ctx::default()),
+            },
+        );
+        assert!(count >= 2); // At least the group and literal
     }
 }
