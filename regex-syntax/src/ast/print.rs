@@ -4,11 +4,18 @@ This module provides a regular expression printer for `Ast`.
 
 use core::fmt;
 
-use alloc::{format, string::{String, ToString}};
+use alloc::{
+    format,
+    string::{String, ToString},
+};
 
 use recursion::{expand_and_collapse, PartiallyApplied};
 
-use crate::ast::{self, visitor::{AstFrame, project_ast}, Ast};
+use crate::ast::{
+    self,
+    visitor::{project_ast, AstFrame},
+    Ast,
+};
 
 /// A printer for a regular expression abstract syntax tree.
 ///
@@ -34,7 +41,11 @@ impl Printer {
     /// `fmt::Write`. Typical implementations of `fmt::Write` that can be used
     /// here are a `fmt::Formatter` (which is available in `fmt::Display`
     /// implementations) or a `&mut String`.
-    pub fn print<W: fmt::Write>(&mut self, ast: &Ast, mut wtr: W) -> fmt::Result {
+    pub fn print<W: fmt::Write>(
+        &mut self,
+        ast: &Ast,
+        mut wtr: W,
+    ) -> fmt::Result {
         let result = print_ast(ast);
         wtr.write_str(&result)
     }
@@ -68,9 +79,7 @@ fn print_ast(ast: &Ast) -> String {
             AstFrame::Concat { children, .. } => {
                 children.into_iter().collect()
             }
-            AstFrame::Alternation { children, .. } => {
-                children.join("|")
-            }
+            AstFrame::Alternation { children, .. } => children.join("|"),
         },
     )
 }
@@ -103,7 +112,11 @@ fn fmt_repetition_op(op: &ast::RepetitionOp, greedy: bool) -> String {
         OneOrMore => "+?".to_string(),
         Range(ref x) => {
             let base = fmt_repetition_range(x);
-            if greedy { base } else { format!("{}?", base) }
+            if greedy {
+                base
+            } else {
+                format!("{}?", base)
+            }
         }
     }
 }
@@ -196,11 +209,7 @@ fn fmt_flags(ast: &ast::Flags) -> String {
 }
 
 fn fmt_class_bracketed(ast: &ast::ClassBracketed) -> String {
-    let mut s = if ast.negated {
-        "[^".to_string()
-    } else {
-        "[".to_string()
-    };
+    let mut s = if ast.negated { "[^".to_string() } else { "[".to_string() };
     s.push_str(&fmt_class_set(&ast.kind));
     s.push(']');
     s
@@ -225,9 +234,7 @@ fn fmt_class_set_item(item: &ast::ClassSetItem) -> String {
         Unicode(x) => fmt_class_unicode(x),
         Perl(x) => fmt_class_perl(x),
         Bracketed(x) => fmt_class_bracketed(x),
-        Union(x) => {
-            x.items.iter().map(fmt_class_set_item).collect()
-        }
+        Union(x) => x.items.iter().map(fmt_class_set_item).collect(),
     }
 }
 

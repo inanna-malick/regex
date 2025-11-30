@@ -7,7 +7,11 @@ use core::cell::Cell;
 use alloc::{boxed::Box, string::ToString, vec, vec::Vec};
 
 use crate::{
-    ast::{self, visitor::{AstFrame, project_ast}, Ast, Span},
+    ast::{
+        self,
+        visitor::{project_ast, AstFrame},
+        Ast, Span,
+    },
     either::Either,
     hir::{self, Error, ErrorKind, Hir, HirKind},
     unicode::{self, ClassQuery},
@@ -187,26 +191,10 @@ impl Translator {
                 }
                 current
             }
-            Ast::Group(g) => {
-                // Groups with flags: the group's flags apply inside, but on exit
-                // we restore to what they were before (with the group's explicit
-                // flags merged in for NonCapturing groups that set flags)
-                match &g.kind {
-                    ast::GroupKind::NonCapturing(ast_flags) => {
-                        // Non-capturing groups like (?i:...) have their own flag scope
-                        // After exiting, flags revert to what they were before
-                        // But first we need to compute what happens inside
-                        let mut inner_flags = Flags::from_ast(ast_flags);
-                        inner_flags.merge(&flags);
-                        // Process child with inner flags, but return original flags
-                        let _ = Self::compute_exit_flags(&g.ast, inner_flags);
-                        flags
-                    }
-                    _ => {
-                        // Capturing groups don't change flags
-                        Self::compute_exit_flags(&g.ast, flags)
-                    }
-                }
+            Ast::Group(_) => {
+                // All groups (capturing and non-capturing) restore flags on exit.
+                // Flag changes inside a group don't leak to subsequent siblings.
+                flags
             }
             Ast::Repetition(r) => Self::compute_exit_flags(&r.ast, flags),
             // Leaf nodes don't change flags
@@ -236,15 +224,20 @@ impl Translator {
                     Ast::Concat(c) => {
                         // For concatenation, flags from Ast::Flags nodes affect subsequent siblings
                         let mut current_flags = flags;
-                        let children: Vec<_> = c.asts.iter().map(|child| {
-                            // If this child is a Flags node, update flags for subsequent siblings
-                            if let Ast::Flags(ref f) = child {
-                                let mut new_flags = Flags::from_ast(&f.flags);
-                                new_flags.merge(&current_flags);
-                                current_flags = new_flags;
-                            }
-                            (child, current_flags)
-                        }).collect();
+                        let children: Vec<_> = c
+                            .asts
+                            .iter()
+                            .map(|child| {
+                                // If this child is a Flags node, update flags for subsequent siblings
+                                if let Ast::Flags(ref f) = child {
+                                    let mut new_flags =
+                                        Flags::from_ast(&f.flags);
+                                    new_flags.merge(&current_flags);
+                                    current_flags = new_flags;
+                                }
+                                (child, current_flags)
+                            })
+                            .collect();
                         Ok(FrameWithFlags {
                             flags,
                             frame: AstFrame::Concat { span: c.span, children },
@@ -274,15 +267,25 @@ impl Translator {
                         // branches affect later branches. This matches the original visitor
                         // behavior where set_flags() persists across alternation branches.
                         let mut current_flags = flags;
-                        let children: Vec<_> = a.asts.iter().map(|child| {
-                            let child_flags = current_flags;
-                            // Check if this branch starts with flags (directly or in a Concat)
-                            current_flags = Self::compute_exit_flags(child, current_flags);
-                            (child, child_flags)
-                        }).collect();
+                        let children: Vec<_> = a
+                            .asts
+                            .iter()
+                            .map(|child| {
+                                let child_flags = current_flags;
+                                // Check if this branch starts with flags (directly or in a Concat)
+                                current_flags = Self::compute_exit_flags(
+                                    child,
+                                    current_flags,
+                                );
+                                (child, child_flags)
+                            })
+                            .collect();
                         Ok(FrameWithFlags {
                             flags,
-                            frame: AstFrame::Alternation { span: a.span, children },
+                            frame: AstFrame::Alternation {
+                                span: a.span,
+                                children,
+                            },
                         })
                     }
                     _ => {
@@ -290,7 +293,9 @@ impl Translator {
                         let frame = project_ast(node);
                         Ok(FrameWithFlags {
                             flags,
-                            frame: AstFrame::map_frame(frame, |child| (child, flags)),
+                            frame: AstFrame::map_frame(frame, |child| {
+                                (child, flags)
+                            }),
                         })
                     }
                 }
@@ -310,14 +315,16 @@ struct FrameWithFlags<A> {
 impl MappableFrame for FrameWithFlags<PartiallyApplied> {
     type Frame<X> = FrameWithFlags<X>;
 
-    fn map_frame<A, B>(input: Self::Frame<A>, f: impl FnMut(A) -> B) -> Self::Frame<B> {
+    fn map_frame<A, B>(
+        input: Self::Frame<A>,
+        f: impl FnMut(A) -> B,
+    ) -> Self::Frame<B> {
         FrameWithFlags {
             flags: input.flags,
             frame: AstFrame::map_frame(input.frame, f),
         }
     }
 }
-
 
 /// The internal implementation of a translator.
 ///
@@ -371,15 +378,9 @@ impl<'t, 'p> TranslatorI<'t, 'p> {
                 // choice.
                 Ok(Hir::empty())
             }
-            AstFrame::Literal(ref x) => {
-                self.hir_literal(x)
-            }
-            AstFrame::Dot(span) => {
-                self.hir_dot(span)
-            }
-            AstFrame::Assertion(ref x) => {
-                self.hir_assertion(x)
-            }
+            AstFrame::Literal(ref x) => self.hir_literal(x),
+            AstFrame::Dot(span) => self.hir_dot(span),
+            AstFrame::Assertion(ref x) => self.hir_assertion(x),
             AstFrame::ClassPerl(ref x) => {
                 if self.flags().unicode() {
                     let cls = self.hir_perl_unicode_class(x)?;
@@ -395,9 +396,7 @@ impl<'t, 'p> TranslatorI<'t, 'p> {
                 let cls = hir::Class::Unicode(self.hir_unicode_class(x)?);
                 Ok(Hir::class(cls))
             }
-            AstFrame::ClassBracketed(ref ast) => {
-                self.hir_class_bracketed(ast)
-            }
+            AstFrame::ClassBracketed(ref ast) => self.hir_class_bracketed(ast),
             AstFrame::Repetition { span: _, ref op, greedy, child: expr } => {
                 Ok(self.hir_repetition_impl(op, greedy, expr))
             }
@@ -447,7 +446,12 @@ impl<'t, 'p> TranslatorI<'t, 'p> {
     }
 
     /// Translate a repetition AST node to HIR.
-    fn hir_repetition_impl(&self, op: &ast::RepetitionOp, greedy: bool, expr: Hir) -> Hir {
+    fn hir_repetition_impl(
+        &self,
+        op: &ast::RepetitionOp,
+        greedy: bool,
+        expr: Hir,
+    ) -> Hir {
         let (min, max) = match op.kind {
             ast::RepetitionKind::ZeroOrOne => (0, Some(1)),
             ast::RepetitionKind::ZeroOrMore => (0, None),
@@ -463,8 +467,7 @@ impl<'t, 'p> TranslatorI<'t, 'p> {
                 n,
             )) => (m, Some(n)),
         };
-        let greedy =
-            if self.flags().swap_greed() { !greedy } else { greedy };
+        let greedy = if self.flags().swap_greed() { !greedy } else { greedy };
         Hir::repetition(hir::Repetition {
             min,
             max,
@@ -487,15 +490,23 @@ impl<'t, 'p> TranslatorI<'t, 'p> {
     }
 
     /// Translate a ClassSet to a Unicode class.
-    fn hir_class_set_unicode(&self, set: &ast::ClassSet) -> Result<hir::ClassUnicode> {
+    fn hir_class_set_unicode(
+        &self,
+        set: &ast::ClassSet,
+    ) -> Result<hir::ClassUnicode> {
         match set {
             ast::ClassSet::Item(item) => self.hir_class_set_item_unicode(item),
-            ast::ClassSet::BinaryOp(op) => self.hir_class_binary_op_unicode(op),
+            ast::ClassSet::BinaryOp(op) => {
+                self.hir_class_binary_op_unicode(op)
+            }
         }
     }
 
     /// Translate a ClassSet to a byte class.
-    fn hir_class_set_bytes(&self, set: &ast::ClassSet) -> Result<hir::ClassBytes> {
+    fn hir_class_set_bytes(
+        &self,
+        set: &ast::ClassSet,
+    ) -> Result<hir::ClassBytes> {
         match set {
             ast::ClassSet::Item(item) => self.hir_class_set_item_bytes(item),
             ast::ClassSet::BinaryOp(op) => self.hir_class_binary_op_bytes(op),
@@ -503,7 +514,10 @@ impl<'t, 'p> TranslatorI<'t, 'p> {
     }
 
     /// Translate a ClassSetItem to a Unicode class.
-    fn hir_class_set_item_unicode(&self, item: &ast::ClassSetItem) -> Result<hir::ClassUnicode> {
+    fn hir_class_set_item_unicode(
+        &self,
+        item: &ast::ClassSetItem,
+    ) -> Result<hir::ClassUnicode> {
         match item {
             ast::ClassSetItem::Empty(_) => Ok(hir::ClassUnicode::empty()),
             ast::ClassSetItem::Literal(x) => {
@@ -536,7 +550,10 @@ impl<'t, 'p> TranslatorI<'t, 'p> {
     }
 
     /// Translate a ClassSetItem to a byte class.
-    fn hir_class_set_item_bytes(&self, item: &ast::ClassSetItem) -> Result<hir::ClassBytes> {
+    fn hir_class_set_item_bytes(
+        &self,
+        item: &ast::ClassSetItem,
+    ) -> Result<hir::ClassBytes> {
         match item {
             ast::ClassSetItem::Empty(_) => Ok(hir::ClassBytes::empty()),
             ast::ClassSetItem::Literal(x) => {
@@ -574,7 +591,10 @@ impl<'t, 'p> TranslatorI<'t, 'p> {
     }
 
     /// Translate a binary class set operation to a Unicode class.
-    fn hir_class_binary_op_unicode(&self, op: &ast::ClassSetBinaryOp) -> Result<hir::ClassUnicode> {
+    fn hir_class_binary_op_unicode(
+        &self,
+        op: &ast::ClassSetBinaryOp,
+    ) -> Result<hir::ClassUnicode> {
         use crate::ast::ClassSetBinaryOpKind::*;
 
         let mut lhs = self.hir_class_set_unicode(&op.lhs)?;
@@ -582,10 +602,16 @@ impl<'t, 'p> TranslatorI<'t, 'p> {
 
         if self.flags().case_insensitive() {
             lhs.try_case_fold_simple().map_err(|_| {
-                self.error(op.lhs.span().clone(), ErrorKind::UnicodeCaseUnavailable)
+                self.error(
+                    op.lhs.span().clone(),
+                    ErrorKind::UnicodeCaseUnavailable,
+                )
             })?;
             rhs.try_case_fold_simple().map_err(|_| {
-                self.error(op.rhs.span().clone(), ErrorKind::UnicodeCaseUnavailable)
+                self.error(
+                    op.rhs.span().clone(),
+                    ErrorKind::UnicodeCaseUnavailable,
+                )
             })?;
         }
 
@@ -598,7 +624,10 @@ impl<'t, 'p> TranslatorI<'t, 'p> {
     }
 
     /// Translate a binary class set operation to a byte class.
-    fn hir_class_binary_op_bytes(&self, op: &ast::ClassSetBinaryOp) -> Result<hir::ClassBytes> {
+    fn hir_class_binary_op_bytes(
+        &self,
+        op: &ast::ClassSetBinaryOp,
+    ) -> Result<hir::ClassBytes> {
         use crate::ast::ClassSetBinaryOpKind::*;
 
         let mut lhs = self.hir_class_set_bytes(&op.lhs)?;

@@ -7,8 +7,8 @@ use core::cmp::Ordering;
 use alloc::{boxed::Box, string::String, vec, vec::Vec};
 
 pub use crate::ast::visitor::{
-    project_ast, project_class_set, project_class_set_item,
-    AstFrame, ClassSetFrame, ClassSetChild, WithContext,
+    project_ast, project_class_set, project_class_set_item, AstFrame,
+    ClassSetChild, ClassSetFrame, WithContext,
 };
 
 pub mod parse;

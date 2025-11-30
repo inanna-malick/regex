@@ -83,7 +83,10 @@ pub enum AstFrame<A> {
 impl MappableFrame for AstFrame<PartiallyApplied> {
     type Frame<X> = AstFrame<X>;
 
-    fn map_frame<A, B>(input: Self::Frame<A>, mut f: impl FnMut(A) -> B) -> Self::Frame<B> {
+    fn map_frame<A, B>(
+        input: Self::Frame<A>,
+        mut f: impl FnMut(A) -> B,
+    ) -> Self::Frame<B> {
         match input {
             AstFrame::Empty(span) => AstFrame::Empty(span),
             AstFrame::Flags(flags) => AstFrame::Flags(flags),
@@ -99,11 +102,15 @@ impl MappableFrame for AstFrame<PartiallyApplied> {
             AstFrame::Group { span, kind, child } => {
                 AstFrame::Group { span, kind, child: f(child) }
             }
-            AstFrame::Concat { span, children } => {
-                AstFrame::Concat { span, children: children.into_iter().map(f).collect() }
-            }
+            AstFrame::Concat { span, children } => AstFrame::Concat {
+                span,
+                children: children.into_iter().map(f).collect(),
+            },
             AstFrame::Alternation { span, children } => {
-                AstFrame::Alternation { span, children: children.into_iter().map(f).collect() }
+                AstFrame::Alternation {
+                    span,
+                    children: children.into_iter().map(f).collect(),
+                }
             }
         }
     }
@@ -191,7 +198,10 @@ pub enum ClassSetFrame<A> {
 impl MappableFrame for ClassSetFrame<PartiallyApplied> {
     type Frame<X> = ClassSetFrame<X>;
 
-    fn map_frame<A, B>(input: Self::Frame<A>, mut f: impl FnMut(A) -> B) -> Self::Frame<B> {
+    fn map_frame<A, B>(
+        input: Self::Frame<A>,
+        mut f: impl FnMut(A) -> B,
+    ) -> Self::Frame<B> {
         match input {
             ClassSetFrame::Empty(span) => ClassSetFrame::Empty(span),
             ClassSetFrame::Literal(lit) => ClassSetFrame::Literal(lit),
@@ -202,18 +212,26 @@ impl MappableFrame for ClassSetFrame<PartiallyApplied> {
             ClassSetFrame::Bracketed { span, negated, child } => {
                 ClassSetFrame::Bracketed { span, negated, child: f(child) }
             }
-            ClassSetFrame::Union { span, children } => {
-                ClassSetFrame::Union { span, children: children.into_iter().map(f).collect() }
-            }
+            ClassSetFrame::Union { span, children } => ClassSetFrame::Union {
+                span,
+                children: children.into_iter().map(f).collect(),
+            },
             ClassSetFrame::BinaryOp { span, kind, lhs, rhs } => {
-                ClassSetFrame::BinaryOp { span, kind, lhs: f(lhs), rhs: f(rhs) }
+                ClassSetFrame::BinaryOp {
+                    span,
+                    kind,
+                    lhs: f(lhs),
+                    rhs: f(rhs),
+                }
             }
         }
     }
 }
 
 /// Project a ClassSet into a frame.
-pub fn project_class_set(set: &ast::ClassSet) -> ClassSetFrame<&ast::ClassSet> {
+pub fn project_class_set(
+    set: &ast::ClassSet,
+) -> ClassSetFrame<&ast::ClassSet> {
     match set {
         ast::ClassSet::Item(item) => project_class_set_item_as_set(item),
         ast::ClassSet::BinaryOp(op) => ClassSetFrame::BinaryOp {
@@ -225,7 +243,9 @@ pub fn project_class_set(set: &ast::ClassSet) -> ClassSetFrame<&ast::ClassSet> {
     }
 }
 
-fn project_class_set_item_as_set(item: &ast::ClassSetItem) -> ClassSetFrame<&ast::ClassSet> {
+fn project_class_set_item_as_set(
+    item: &ast::ClassSetItem,
+) -> ClassSetFrame<&ast::ClassSet> {
     // For items that aren't naturally ClassSet, we need to handle them specially.
     // This is a bit awkward because ClassSetItem::Union contains ClassSetItems, not ClassSets.
     // For now, we'll panic on Union - callers should use project_class_set_item instead.
@@ -248,7 +268,9 @@ fn project_class_set_item_as_set(item: &ast::ClassSetItem) -> ClassSetFrame<&ast
 }
 
 /// Project a ClassSetItem into a frame with ClassSetItem children.
-pub fn project_class_set_item(item: &ast::ClassSetItem) -> ClassSetFrame<ClassSetChild<'_>> {
+pub fn project_class_set_item(
+    item: &ast::ClassSetItem,
+) -> ClassSetFrame<ClassSetChild<'_>> {
     match item {
         ast::ClassSetItem::Empty(span) => ClassSetFrame::Empty(*span),
         ast::ClassSetItem::Literal(lit) => ClassSetFrame::Literal(lit.clone()),
@@ -303,8 +325,12 @@ mod tests {
             &ast,
             |node| project_ast(node),
             |frame| match frame {
-                AstFrame::Concat { children, .. } => 1 + children.into_iter().sum::<usize>(),
-                AstFrame::Alternation { children, .. } => 1 + children.into_iter().sum::<usize>(),
+                AstFrame::Concat { children, .. } => {
+                    1 + children.into_iter().sum::<usize>()
+                }
+                AstFrame::Alternation { children, .. } => {
+                    1 + children.into_iter().sum::<usize>()
+                }
                 AstFrame::Repetition { child, .. } => 1 + child,
                 AstFrame::Group { child, .. } => 1 + child,
                 _ => 1,
@@ -340,7 +366,12 @@ mod tests {
     fn test_fallible() {
         let ast = Parser::new().parse(r"a*").unwrap();
 
-        let result: Result<(), &str> = recursion::try_expand_and_collapse::<AstFrame<PartiallyApplied>, _, _, _>(
+        let result: Result<(), &str> = recursion::try_expand_and_collapse::<
+            AstFrame<PartiallyApplied>,
+            _,
+            _,
+            _,
+        >(
             &ast,
             |node| Ok(project_ast(node)),
             |frame| match frame {
@@ -357,7 +388,9 @@ mod tests {
         let ast = Parser::new().parse(r"(?i)a").unwrap();
 
         #[derive(Clone, Debug, Default)]
-        struct Ctx { case_insensitive: bool }
+        struct Ctx {
+            case_insensitive: bool,
+        }
 
         // Count nodes, tracking if we're inside a case-insensitive group
         let (count, _) = expand_and_collapse::<AstFrame<PartiallyApplied>, _, _>(
@@ -366,10 +399,16 @@ mod tests {
                 let frame = project_ast(node);
                 // If this is a group with flags, update context for children
                 let child_ctx = match &frame {
-                    AstFrame::Group { kind: ast::GroupKind::NonCapturing(flags), .. } => {
+                    AstFrame::Group {
+                        kind: ast::GroupKind::NonCapturing(flags),
+                        ..
+                    } => {
                         let mut new_ctx = ctx.clone();
                         for item in &flags.items {
-                            if let ast::FlagsItemKind::Flag(ast::Flag::CaseInsensitive) = item.kind {
+                            if let ast::FlagsItemKind::Flag(
+                                ast::Flag::CaseInsensitive,
+                            ) = item.kind
+                            {
                                 new_ctx.case_insensitive = true;
                             }
                         }
@@ -380,14 +419,18 @@ mod tests {
                 AstFrame::map_frame(frame, |child| (child, child_ctx.clone()))
             },
             |frame| match frame {
-                AstFrame::Concat { children, .. } |
-                AstFrame::Alternation { children, .. } => {
+                AstFrame::Concat { children, .. }
+                | AstFrame::Alternation { children, .. } => {
                     let sum: usize = children.iter().map(|(c, _)| c).sum();
-                    let ctx = children.into_iter().next().map(|(_, c)| c).unwrap_or_default();
+                    let ctx = children
+                        .into_iter()
+                        .next()
+                        .map(|(_, c)| c)
+                        .unwrap_or_default();
                     (1 + sum, ctx)
                 }
-                AstFrame::Repetition { child: (c, ctx), .. } |
-                AstFrame::Group { child: (c, ctx), .. } => (1 + c, ctx),
+                AstFrame::Repetition { child: (c, ctx), .. }
+                | AstFrame::Group { child: (c, ctx), .. } => (1 + c, ctx),
                 _ => (1, Ctx::default()),
             },
         );

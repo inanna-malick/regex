@@ -2265,8 +2265,10 @@ fn check_nest_limit<P: Borrow<Parser>>(
     p: &ParserI<'_, P>,
     ast: &Ast,
 ) -> Result<()> {
-    use ast::visitor::{AstFrame, project_ast};
-    use recursion::{try_expand_and_collapse, MappableFrame, PartiallyApplied};
+    use ast::visitor::{project_ast, AstFrame};
+    use recursion::{
+        try_expand_and_collapse, MappableFrame, PartiallyApplied,
+    };
 
     let limit = p.parser().nest_limit;
 
@@ -2293,7 +2295,10 @@ fn check_nest_limit<P: Borrow<Parser>>(
 
             let child_depth = if is_recursive {
                 let new_depth = depth.checked_add(1).ok_or_else(|| {
-                    p.error(span.unwrap().clone(), ast::ErrorKind::NestLimitExceeded(u32::MAX))
+                    p.error(
+                        span.unwrap().clone(),
+                        ast::ErrorKind::NestLimitExceeded(u32::MAX),
+                    )
                 })?;
                 if new_depth > limit {
                     return Err(p.error(
@@ -2308,7 +2313,12 @@ fn check_nest_limit<P: Borrow<Parser>>(
 
             // For ClassBracketed, we also need to check the nested class set
             if let Ast::ClassBracketed(ref class) = node {
-                check_class_set_nest_limit(p, &class.kind, child_depth, limit)?;
+                check_class_set_nest_limit(
+                    p,
+                    &class.kind,
+                    child_depth,
+                    limit,
+                )?;
             }
 
             // Project and attach child depth
@@ -2327,11 +2337,16 @@ fn check_class_set_nest_limit<P: Borrow<Parser>>(
     limit: u32,
 ) -> Result<()> {
     match set {
-        ast::ClassSet::Item(item) => check_class_set_item_nest_limit(p, item, depth, limit),
+        ast::ClassSet::Item(item) => {
+            check_class_set_item_nest_limit(p, item, depth, limit)
+        }
         ast::ClassSet::BinaryOp(op) => {
             // Binary ops increase depth
             let new_depth = depth.checked_add(1).ok_or_else(|| {
-                p.error(op.span.clone(), ast::ErrorKind::NestLimitExceeded(u32::MAX))
+                p.error(
+                    op.span.clone(),
+                    ast::ErrorKind::NestLimitExceeded(u32::MAX),
+                )
             })?;
             if new_depth > limit {
                 return Err(p.error(
@@ -2362,7 +2377,10 @@ fn check_class_set_item_nest_limit<P: Borrow<Parser>>(
         | ast::ClassSetItem::Perl(_) => Ok(()),
         ast::ClassSetItem::Bracketed(ref b) => {
             let new_depth = depth.checked_add(1).ok_or_else(|| {
-                p.error(b.span.clone(), ast::ErrorKind::NestLimitExceeded(u32::MAX))
+                p.error(
+                    b.span.clone(),
+                    ast::ErrorKind::NestLimitExceeded(u32::MAX),
+                )
             })?;
             if new_depth > limit {
                 return Err(p.error(
@@ -2374,7 +2392,10 @@ fn check_class_set_item_nest_limit<P: Borrow<Parser>>(
         }
         ast::ClassSetItem::Union(ref u) => {
             let new_depth = depth.checked_add(1).ok_or_else(|| {
-                p.error(u.span.clone(), ast::ErrorKind::NestLimitExceeded(u32::MAX))
+                p.error(
+                    u.span.clone(),
+                    ast::ErrorKind::NestLimitExceeded(u32::MAX),
+                )
             })?;
             if new_depth > limit {
                 return Err(p.error(
